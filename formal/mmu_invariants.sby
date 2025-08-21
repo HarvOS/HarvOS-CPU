@@ -1,0 +1,16 @@
+[options]
+mode bmc
+depth 32
+expect pass
+
+[engines]
+smtbmc z3
+
+[script]
+read -formal -sv HarvOS/src/rtl/mmu_sv32.sv
+read -formal -sv formal/mmu_harness.sv
+prep -top mmu_harness
+
+[files]
+HarvOS/src/rtl/mmu_sv32.sv
+formal/mmu_harness.sv

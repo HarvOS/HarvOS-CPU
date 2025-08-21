@@ -1,0 +1,16 @@
+# HarvOS Bring-Up TODO (Initial)
+- [x] Fix `decoder.sv`: add `imm_u` port, move U-immediate inside the module, remove stray code
+- [ ] MMU Sv32: complete TLB fill path with W^X check; ASID tagging; faults
+- [x] PTW Sv32: finish 2-level walk; V/R/W/X/U/G checked; superpage handled
+- [x] PTW extras: A/D handling (software-managed page-fault)
+- [x] MXR/SUM semantics in MMU (csr_sstatus_q[19]/[18])
+- [ ] D-Cache: complete miss/fill state machine; write-through path; early restart
+- [x] I-Cache: execute-only annotated + assert hook (HARVOS_ASSERT)
+- [x] W^X invariants: enforce in MMU (ITLB never W; DTLB never X) — fill-time gating added; illegal W&X faults
+- [x] MPU integration: lock bit after boot (lock_q added; programming gated when locked)
+- [ ] MPU tests: NX-RAM and privileged MMIO
+- [ ] CSR/IRQ: validate mideleg/medeleg flows; sstatus bits; satp.MODE Sv32
+- [ ] Testbench: add negative tests (exec-from-RAM → trap; user MMIO → fault)
+- [ ] Formal SVA: add properties for Harvard separation, precise traps
+- [x] Formal SVA: W^X invariants inside mmu (HARVOS_ASSERT)
+- [ ] CI: Verilator lint + build; treat warnings as errors

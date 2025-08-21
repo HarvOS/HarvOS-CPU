@@ -1,0 +1,8 @@
+This open hardware project is provided "AS IS" with no warranty
+of fitness for production or safety-critical use.
+
+It is intended for research and educational purposes only.
+Users must review and verify functionality before deployment.
+
+This core implements only a subset of the RISC-V ISA and privilege
+architecture. It has not been certified by RISC-V International.

@@ -1,0 +1,7 @@
+# Yosys plain SystemVerilog flow (fallback)
+read_verilog -sv rtl/*.sv 
+read_verilog -sv top_soc.sv
+hierarchy -check -top top_soc
+proc; opt; fsm; opt; memory -nomap; opt
+synth_xilinx -family xc7 -top top_soc -flatten
+stat

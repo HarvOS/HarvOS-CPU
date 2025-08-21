@@ -1,0 +1,19 @@
+[tasks]
+prove: mode prove
+cover: mode cover
+
+[engines]
+smtbmc z3
+
+[script]
+read -formal -sv -I src/rtl -I src/tmp src/rtl/harvos_core.sv src/rtl/harvos_sva_pkg.sv src/rtl/harvos_sva_bind.sv
+prep -top harvos_core
+
+[files]
+src/rtl/harvos_core.sv
+src/rtl/harvos_sva_pkg.sv
+src/rtl/harvos_sva_bind.sv
+src/tmp/harvos_sva_bind.sv
+src/tmp/formal_abdeckung.sv
+src/rtl/mmu_sv32.sv
+src/rtl/mpu.sv

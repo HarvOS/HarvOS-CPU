@@ -1,0 +1,285 @@
+
+`include "harvos_pkg_flat.svh"
+
+module csr_file (
+  input  logic                    clk,
+  input  logic                    rst_n,
+
+  input  priv_e       cur_priv,
+  input  logic                    do_sret,
+  input  logic                    do_mret,
+  output priv_e       next_priv,
+
+  input  logic                    csr_en,
+  input  logic [2:0]              csr_funct3,
+  input  logic [11:0]             csr_addr,
+  input  logic [31:0]             csr_wval,
+  output logic [31:0]             csr_rval,
+  output logic                    csr_illegal,
+
+  input  logic                    entropy_valid,
+  input  logic [31:0]             entropy_data,
+
+  input  logic                    trap_set,
+  input  logic                    trap_is_irq,
+  input  logic [4:0]              trap_scause,
+  input  logic [31:0]             trap_sepc,
+  input  logic [31:0]             trap_stval,
+
+  input  logic [31:0]             time_value,
+
+  output logic [31:0]             csr_sstatus_q,
+  output logic [31:0]             csr_stvec_q,
+  output logic [31:0]             csr_sepc_q,
+  output logic [31:0]             csr_scause_q,
+  output logic [31:0]             csr_stval_q,
+  output logic [31:0]             csr_satp_q,
+  output logic [31:0]             csr_sie_q,
+  output logic [31:0]             csr_sip_q,
+  output logic [31:0]             csr_smpuctl_q,
+  output logic [31:0]             csr_mepc_q,
+  output logic [31:0]             csr_mstatus_q
+);
+  logic [31:0] sstatus_q, sstatus_d, stvec_q, sepc_q, scause_q, stval_q, satp_q;
+  logic [31:0] sie_q, sip_q;
+  logic [31:0] stimecmp_q, srandom_q, smpuctl_q;
+  logic [31:0] mstatus_q, mtvec_q, mepc_q, mcause_q, mtval_q;
+  logic [31:0] mie_q, mip_q, medeleg_q, mideleg_q;
+  wire csr_wr  = csr_en & (csr_funct3 == F3_CSRRW);
+  wire csr_set = csr_en & (csr_funct3 == F3_CSRRS);
+  wire csr_clr = csr_en & (csr_funct3 == F3_CSRRC);
+
+  function logic csr_writable(input [11:0] addr, input priv_e p);
+    case (addr)
+      CSR_SSTATUS,
+      CSR_STVEC, CSR_SEPC, CSR_SCAUSE,
+      CSR_STVAL, CSR_SATP, CSR_SIE,
+      CSR_SIP, CSR_STIME, CSR_STIMECMP,
+      CSR_SRANDOM, CSR_SMPUCTL:
+        csr_writable = (p != PRIV_U);
+      CSR_MSTATUS, CSR_MEDELEG, CSR_MIDELEG,
+      CSR_MIE, CSR_MTVEC, CSR_MEPC,
+      CSR_MCAUSE, CSR_MTVAL, CSR_MIP:
+        csr_writable = (p == PRIV_M);
+      default: csr_writable = 1'b0;
+    endcase
+  endfunction
+
+  function logic [31:0] csr_read_mux(input [11:0] addr);
+    case (addr)
+      CSR_SSTATUS:  csr_read_mux = sstatus_q;
+      CSR_STVEC:    csr_read_mux = stvec_q;
+      CSR_SEPC:     csr_read_mux = sepc_q;
+      CSR_SCAUSE:   csr_read_mux = scause_q;
+      CSR_STVAL:    csr_read_mux = stval_q;
+      CSR_SATP:     csr_read_mux = satp_q;
+      CSR_SIE:      csr_read_mux = sie_q;
+      CSR_SIP:      csr_read_mux = sip_q;
+      CSR_STIME:    csr_read_mux = time_value;
+      CSR_STIMECMP: csr_read_mux = stimecmp_q;
+      CSR_SRANDOM:  csr_read_mux = srandom_q;
+      CSR_SMPUCTL:  csr_read_mux = smpuctl_q;
+
+      CSR_MSTATUS:   csr_read_mux = mstatus_q;
+      CSR_MISA:      csr_read_mux = 32'h4000_010;
+      CSR_MEDELEG:   csr_read_mux = medeleg_q;
+      CSR_MIDELEG:   csr_read_mux = mideleg_q;
+      CSR_MIE:       csr_read_mux = mie_q;
+      CSR_MTVEC:     csr_read_mux = mtvec_q;
+      CSR_MSCRATCH:  csr_read_mux = 32'h0;
+      CSR_MEPC:      csr_read_mux = mepc_q;
+      CSR_MCAUSE:    csr_read_mux = mcause_q;
+      CSR_MTVAL:     csr_read_mux = mtval_q;
+      CSR_MIP:       csr_read_mux = mip_q;
+      default: csr_read_mux = 32'h0;
+    endcase
+  endfunction
+
+  
+  // Next-state logic for sstatus (single writer pattern)
+  always_comb begin
+    sstatus_d = sstatus_q;
+    // CSR writes to SSTATUS (writable: SIE, SPIE, SPP)
+    if (csr_en && (csr_addr == CSR_SSTATUS)) begin
+      logic [31:0] masked;
+      masked = csr_wval & 32'h000C0002;
+      if (csr_wr)  sstatus_d = (sstatus_q & ~32'h000C0002) | masked;
+      if (csr_set) sstatus_d = sstatus_q | masked;
+      if (csr_clr) sstatus_d = sstatus_q & ~masked;
+    end      // SRET effects handled in sstatus_d next-state
+  end
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sstatus_q  <= 32'h0;
+      stvec_q    <= 32'h0;
+      sepc_q     <= 32'h0;
+      scause_q   <= 32'h0;
+      stval_q    <= 32'h0;
+      satp_q     <= 32'h0;
+      sie_q      <= 32'h0;
+      sip_q      <= 32'h0;
+      stimecmp_q <= 32'hFFFF_FFFF;
+      srandom_q  <= 32'h0;
+      smpuctl_q  <= 32'h0;
+
+      mstatus_q  <= 32'h0;
+      mtvec_q    <= 32'h0;
+      mepc_q     <= 32'h0;
+      mcause_q   <= 32'h0;
+      mtval_q    <= 32'h0;
+      mie_q      <= 32'h0;
+      mip_q      <= 32'h0;
+      medeleg_q  <= 32'h0;
+      mideleg_q  <= 32'h0;
+    end else begin
+      if (trap_set) begin
+        if (cur_priv == PRIV_S || cur_priv == PRIV_U) begin
+          scause_q <= {trap_is_irq, 26'd0, trap_scause};
+          sepc_q   <= trap_sepc & 32'hFFFF_FFFC;
+          stval_q  <= trap_stval;
+        end else begin
+          mcause_q <= {trap_is_irq, 26'd0, trap_scause};
+          mepc_q   <= trap_sepc & 32'hFFFF_FFFC;
+          mtval_q  <= trap_stval;
+        end
+      end
+
+      if (csr_en && csr_writable(csr_addr, cur_priv)) begin
+        unique case (csr_addr)
+          CSR_SSTATUS: begin /* sstatus handled in sstatus_d next-state */ end
+          CSR_STVEC: begin
+            if (csr_wr)  stvec_q <= csr_wval & 32'hFFFF_FFFC;
+            if (csr_set) stvec_q <= (stvec_q | csr_wval) & 32'hFFFF_FFFC;
+            if (csr_clr) stvec_q <= (stvec_q & ~csr_wval) & 32'hFFFF_FFFC;
+          end
+          CSR_SEPC: begin
+            if (csr_wr)  sepc_q <= csr_wval & 32'hFFFF_FFFC;
+            if (csr_set) sepc_q <= (sepc_q | csr_wval) & 32'hFFFF_FFFC;
+            if (csr_clr) sepc_q <= (sepc_q & ~csr_wval) & 32'hFFFF_FFFC;
+          end
+          CSR_SCAUSE: begin
+            if (csr_wr)  scause_q <= csr_wval;
+            if (csr_set) scause_q <= scause_q | csr_wval;
+            if (csr_clr) scause_q <= scause_q & ~csr_wval;
+          end
+          CSR_STVAL: begin
+            if (csr_wr)  stval_q <= csr_wval;
+            if (csr_set) stval_q <= stval_q | csr_wval;
+            if (csr_clr) stval_q <= stval_q & ~csr_wval;
+          end
+          CSR_SATP: begin
+            if (csr_wr)  satp_q <= csr_wval;
+            if (csr_set) satp_q <= satp_q | csr_wval;
+            if (csr_clr) satp_q <= satp_q & ~csr_wval;
+          end
+          CSR_SIE: begin
+            if (csr_wr)  sie_q <= csr_wval;
+            if (csr_set) sie_q <= sie_q | csr_wval;
+            if (csr_clr) sie_q <= sie_q & ~csr_wval;
+          end
+          CSR_SIP: begin
+            if (csr_wr)  sip_q[1] <= csr_wval[1];
+            if (csr_set) sip_q[1] <= sip_q[1] | csr_wval[1];
+            if (csr_clr) sip_q[1] <= sip_q[1] & ~csr_wval[1];
+          end
+          CSR_STIMECMP: begin
+            if (csr_wr)  stimecmp_q <= csr_wval;
+            if (csr_set) stimecmp_q <= stimecmp_q | csr_wval;
+            if (csr_clr) stimecmp_q <= stimecmp_q & ~csr_wval;
+          end
+          CSR_SRANDOM: begin
+            if (csr_wr && entropy_valid) srandom_q <= entropy_data;
+          end
+          CSR_SMPUCTL: begin
+            if (!smpuctl_q[0]) begin
+              if (csr_wr)  smpuctl_q <= csr_wval;
+              if (csr_set) smpuctl_q <= smpuctl_q | csr_wval;
+              if (csr_clr) smpuctl_q <= smpuctl_q & ~csr_wval;
+            end
+          end
+
+          CSR_MSTATUS: begin
+  if (csr_wr)  mstatus_q <= (mstatus_q & ~MSTATUS_WMASK) | (csr_wval & MSTATUS_WMASK);
+  if (csr_set) mstatus_q <=  mstatus_q |  (csr_wval & MSTATUS_WMASK);
+  if (csr_clr) mstatus_q <=  mstatus_q & ~(csr_wval & MSTATUS_WMASK);
+end
+          CSR_MEDELEG: begin
+            if (csr_wr)  medeleg_q <= csr_wval;
+            if (csr_set) medeleg_q <= medeleg_q | csr_wval;
+            if (csr_clr) medeleg_q <= medeleg_q & ~csr_wval;
+          end
+          CSR_MIDELEG: begin
+            if (csr_wr)  mideleg_q <= csr_wval;
+            if (csr_set) mideleg_q <= mideleg_q | csr_wval;
+            if (csr_clr) mideleg_q <= mideleg_q & ~csr_wval;
+          end
+          CSR_MIE: begin
+            if (csr_wr)  mie_q <= csr_wval;
+            if (csr_set) mie_q <= mie_q | csr_wval;
+            if (csr_clr) mie_q <= mie_q & ~csr_wval;
+          end
+          CSR_MTVEC: begin
+            if (csr_wr)  mtvec_q <= csr_wval & 32'hFFFF_FFFC;
+            if (csr_set) mtvec_q <= (mtvec_q | csr_wval) & 32'hFFFF_FFFC;
+            if (csr_clr) mtvec_q <= (mtvec_q & ~csr_wval) & 32'hFFFF_FFFC;
+          end
+          CSR_MEPC: begin
+            if (csr_wr)  mepc_q <= csr_wval & 32'hFFFF_FFFC;
+            if (csr_set) mepc_q <= (mepc_q | csr_wval) & 32'hFFFF_FFFC;
+            if (csr_clr) mepc_q <= (mepc_q & ~csr_wval) & 32'hFFFF_FFFC;
+          end
+          CSR_MCAUSE: begin
+            if (csr_wr)  mcause_q <= csr_wval;
+            if (csr_set) mcause_q <= mcause_q | csr_wval;
+            if (csr_clr) mcause_q <= mcause_q & ~csr_wval;
+          end
+          CSR_MTVAL: begin
+            if (csr_wr)  mtval_q <= csr_wval;
+            if (csr_set) mtval_q <= mtval_q | csr_wval;
+            if (csr_clr) mtval_q <= mtval_q & ~csr_wval;
+          end
+          CSR_MIP: begin
+            if (csr_wr)  mip_q[3] <= csr_wval[3];
+            if (csr_set) mip_q[3] <= mip_q[3] | csr_wval[3];
+            if (csr_clr) mip_q[3] <= mip_q[3] & ~csr_wval[3];
+          end
+          default: ;
+        endcase
+      end
+    end
+      // SRET effects (S-mode): SIE<=SPIE; SPIE<=1; SPP<=U
+      if (do_sret && (cur_priv == PRIV_S)) begin
+        sstatus_q[1] <= sstatus_q[5];
+        sstatus_q[5] <= 1'b1;
+        sstatus_q[8] <= 1'b0;
+      end
+      if (do_mret && (cur_priv == PRIV_M)) begin
+        mstatus_q[3]  <= mstatus_q[7];  // MIE <= MPIE
+        mstatus_q[7]  <= 1'b1;          // MPIE <= 1
+        mstatus_q[12:11] <= 2'b00;      // MPP <= U (00)
+      end
+      sstatus_q <= sstatus_d;
+  end
+
+
+  assign csr_rval    = csr_read_mux(csr_addr);
+  assign csr_illegal = csr_en & ~csr_writable(csr_addr, cur_priv) & (csr_wr | csr_set | csr_clr);
+  assign next_priv = (do_mret && (cur_priv == PRIV_M)) ? (
+                         (mstatus_q[12:11]==2'b00)?PRIV_U:
+                         (mstatus_q[12:11]==2'b01)?PRIV_S:
+                         PRIV_M)
+                       : (do_sret && (cur_priv == PRIV_S)) ? PRIV_U : cur_priv;
+
+  assign csr_sstatus_q  = sstatus_q;
+  assign csr_stvec_q    = stvec_q;
+  assign csr_sepc_q     = sepc_q;
+  assign csr_scause_q   = scause_q;
+  assign csr_stval_q    = stval_q;
+  assign csr_satp_q     = satp_q;
+  assign csr_sie_q      = sie_q;
+  assign csr_sip_q      = sip_q;
+  assign csr_smpuctl_q  = smpuctl_q;
+  assign csr_mepc_q     = mepc_q;
+  assign csr_mstatus_q  = mstatus_q;
+endmodule

@@ -1,0 +1,363 @@
+// top_soc_wrap.sv — Synthesis top that exposes SoC buses and datapaths
+`include "rtl/harvos_pkg_flat.svh"
+`include "rtl/harvos_imem_if.sv"
+`include "rtl/harvos_dmem_if.sv"
+
+module top_soc_wrap(
+  input  logic        clk,
+  input  logic        rst_n,
+  // I-side debug
+  output logic [31:0] dbg_ic_addr,
+  output logic        dbg_ic_req,
+  output logic [31:0] dbg_i_addr_arb,
+  output logic        dbg_i_req_arb,
+  output logic [31:0] dbg_imem_rdata,
+  output logic        dbg_imem_rvalid,
+  output logic        dbg_imem_fault,
+  // D-side debug
+  output logic [31:0] dbg_dc_addr,
+  output logic        dbg_dc_req,
+  output logic [31:0] dbg_dmem_rdata,
+  output logic        dbg_dmem_done,
+  output logic        dbg_dmem_fault,
+  // Shared RAM port debug
+  output logic [31:0] dbg_m_addr,
+  output logic        dbg_m_req,
+  output logic [31:0] dbg_m_rdata,
+  output logic        dbg_m_rvalid,
+  output logic        dbg_m_fault,
+  // D-side write channel
+  output logic [31:0] dbg_dmem_wdata,
+  output logic  [3:0] dbg_dmem_be,
+  output logic        dbg_dmem_we
+);
+  // Harvard IFs
+  harvos_imem_if imem();
+  harvos_dmem_if dmem();
+
+  // Keep core hierarchy to reduce sweeping of internals (Yosys respects keep_hierarchy)
+    
+  // --- Revised: simple MPU programming FSM (synth-friendly, no arrays/typedefs) ---
+  // Define two constant regions for programming at boot.
+  // Adjust these constants to your memory map.
+  localparam logic [31:0] MPU0_BASE      = 32'h0000_0000;
+  localparam logic [31:0] MPU0_LIMIT     = 32'h0000_FFFF; // ROM size - 1
+  localparam logic [2:0]  MPU0_PERM      = 3'b101;        // X=1,W=0,R=1  (R-X)
+  localparam logic        MPU0_USER_OK   = 1'b1;
+  localparam logic        MPU0_IS_ISPACE = 1'b1;          // instruction space
+
+  localparam logic [31:0] MPU1_BASE      = 32'h2000_0000; // RAM base
+  localparam logic [31:0] MPU1_LIMIT     = 32'h2001_FFFF; // RAM end
+  localparam logic [2:0]  MPU1_PERM      = 3'b011;        // X=0,W=1,R=1  (RW, NX)
+  localparam logic        MPU1_USER_OK   = 1'b1;
+  localparam logic        MPU1_IS_ISPACE = 1'b0;
+
+  // Strobes and data to the core's programming port
+  logic        mpu_prog_en_q;
+  logic  [2:0] mpu_prog_idx_q;
+  logic [31:0] mpu_prog_base_q, mpu_prog_limit_q;
+  logic  [2:0] mpu_prog_perm_q;
+  logic        mpu_prog_user_ok_q, mpu_prog_is_ispace_q;
+  // removed duplicate mcfg_e typedef and 3-bit indices (kept single-bit version below)
+// Next-value defaults
+  always_comb begin
+    mcfg_d = mcfg_q;
+    mcfg_i_d = mcfg_i;
+
+    // Default outputs
+    mpu_prog_en_q        = 1'b0;
+    mpu_prog_idx_q       = mcfg_i;
+    mpu_prog_base_q      = 32'h0;
+    mpu_prog_limit_q     = 32'h0;
+    mpu_prog_perm_q      = 3'b000;
+    mpu_prog_user_ok_q   = 1'b0;
+    mpu_prog_is_ispace_q = 1'b0;
+
+    unique case (mcfg_q)
+      MCFG_BASE: begin
+        // program BASE
+        mpu_prog_en_q   = 1'b1;
+        if (mcfg_i == 3'd0) mpu_prog_base_q = MPU0_BASE; else mpu_prog_base_q = MPU1_BASE;
+        mcfg_d = MCFG_LIMIT;
+      end
+      MCFG_LIMIT: begin
+        // program LIMIT
+        mpu_prog_en_q   = 1'b1;
+        if (mcfg_i == 3'd0) mpu_prog_limit_q = MPU0_LIMIT; else mpu_prog_limit_q = MPU1_LIMIT;
+        mcfg_d = MCFG_PERM;
+      end
+      MCFG_PERM: begin
+        // program PERM + flags
+        mpu_prog_en_q        = 1'b1;
+        if (mcfg_i == 3'd0) begin
+          mpu_prog_perm_q      = MPU0_PERM;
+          mpu_prog_user_ok_q   = MPU0_USER_OK;
+          mpu_prog_is_ispace_q = MPU0_IS_ISPACE;
+        end else begin
+          mpu_prog_perm_q      = MPU1_PERM;
+          mpu_prog_user_ok_q   = MPU1_USER_OK;
+          mpu_prog_is_ispace_q = MPU1_IS_ISPACE;
+        end
+        // advance or finish
+        if (mcfg_i == 3'd1) begin
+          mcfg_d = MCFG_IDLE;
+        end else begin
+          mcfg_i_d = 3'd1;
+          mcfg_d   = MCFG_BASE;
+        end
+      end
+      default: ; // IDLE
+    endcase
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      mcfg_q <= MCFG_BASE;
+      mcfg_i <= 3'd0;
+    end else begin
+      mcfg_q <= mcfg_d;
+      mcfg_i <= mcfg_i_d;
+    end
+  end
+
+  // --- Synth-friendly MPU boot programming FSM (no arrays, no dynamic indices) ---
+  // Region 0 (ROM / I-space): R-X
+  localparam logic [31:0] MPU0_BASE      = 32'h0000_0000; // TODO: set actual ROM base
+  localparam logic [31:0] MPU0_LIMIT     = 32'h0000_FFFF; // TODO: set actual ROM end
+  localparam logic [2:0]  MPU0_PERM      = 3'b101;        // X=1, W=0, R=1
+  localparam logic        MPU0_USER_OK   = 1'b1;
+  localparam logic        MPU0_IS_ISPACE = 1'b1;
+
+  // Region 1 (RAM): R/W, NX
+  localparam logic [31:0] MPU1_BASE      = 32'h2000_0000; // TODO: set actual RAM base
+  localparam logic [31:0] MPU1_LIMIT     = 32'h2001_FFFF; // TODO: set actual RAM end
+  localparam logic [2:0]  MPU1_PERM      = 3'b011;        // X=0, W=1, R=1
+  localparam logic        MPU1_USER_OK   = 1'b1;
+  localparam logic        MPU1_IS_ISPACE = 1'b0;
+
+  logic        mpu_prog_en_q;
+  logic  [2:0] mpu_prog_idx_q;
+  logic [31:0] mpu_prog_base_q, mpu_prog_limit_q;
+  logic  [2:0] mpu_prog_perm_q;
+  logic        mpu_prog_user_ok_q, mpu_prog_is_ispace_q;
+
+  typedef enum logic [1:0] { MCFG_IDLE, MCFG_BASE, MCFG_LIMIT, MCFG_PERM } mcfg_e;
+  mcfg_e mcfg_q, mcfg_d;
+  logic  mcfg_i; // 0 for region 0, 1 for region 1
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      mcfg_q        <= MCFG_BASE;
+      mcfg_i        <= 1'b0;
+      mpu_prog_en_q <= 1'b0;
+    end else begin
+      mcfg_q        <= mcfg_d;
+      mpu_prog_en_q <= (mcfg_q != MCFG_IDLE);
+    end
+  end
+
+  always_comb begin
+    mcfg_d = mcfg_q;
+    // defaults each cycle
+    mpu_prog_idx_q       = {2'b00, mcfg_i};
+    mpu_prog_base_q      = 32'h0;
+    mpu_prog_limit_q     = 32'h0;
+    mpu_prog_perm_q      = 3'b000;
+    mpu_prog_user_ok_q   = 1'b0;
+    mpu_prog_is_ispace_q = 1'b0;
+
+    unique case (mcfg_q)
+      MCFG_BASE: begin
+        mpu_prog_base_q = (mcfg_i == 1'b0) ? MPU0_BASE : MPU1_BASE;
+        mcfg_d = MCFG_LIMIT;
+      end
+      MCFG_LIMIT: begin
+        mpu_prog_limit_q = (mcfg_i == 1'b0) ? MPU0_LIMIT : MPU1_LIMIT;
+        mcfg_d = MCFG_PERM;
+      end
+      MCFG_PERM: begin
+        mpu_prog_perm_q      = (mcfg_i == 1'b0) ? MPU0_PERM      : MPU1_PERM;
+        mpu_prog_user_ok_q   = (mcfg_i == 1'b0) ? MPU0_USER_OK   : MPU1_USER_OK;
+        mpu_prog_is_ispace_q = (mcfg_i == 1'b0) ? MPU0_IS_ISPACE : MPU1_IS_ISPACE;
+        if (mcfg_i == 1'b0) begin
+          mcfg_i = 1'b1; mcfg_d = MCFG_BASE;
+        end else begin
+          mcfg_d = MCFG_IDLE;
+        end
+      end
+      default: ; // IDLE
+    endcase
+  end
+
+harvos_core u_core (
+    .clk(clk),
+    .rst_n(rst_n),
+    .imem(imem),
+    .dmem(dmem),
+    .entropy_valid(1'b0),
+    .entropy_data(32'h0),
+    .ext_irq(1'b0),
+    .mpu_prog_en(mpu_prog_en_q),
+    .mpu_prog_idx(mpu_prog_idx_q),
+    .mpu_prog_base(mpu_prog_base_q),
+    .mpu_prog_limit(mpu_prog_limit_q),
+    .mpu_prog_perm(mpu_prog_perm_q),
+    .mpu_prog_user_ok(mpu_prog_user_ok_q),
+    .mpu_prog_is_ispace(mpu_prog_is_ispace_q) //b0)
+  );
+
+  // ---------------- I$ side mux: Boot ROM vs RAM/Arb ----------------
+  localparam integer ROM_BYTES = 16*1024; // 16 KiB @ 0x0000_0000
+  logic        rom_req;
+  logic [31:0] rom_addr;
+  logic [31:0] rom_rdata;
+  logic        rom_rvalid;
+  logic        rom_fault;
+
+  // Expose core's I-side
+  wire        ic_m_req   = imem.req;
+  wire [31:0] ic_m_addr  = imem.addr;
+
+  // ROM window select
+  wire        rom_sel    = (ic_m_addr < ROM_BYTES);
+  assign rom_req         = ic_m_req & rom_sel;
+  assign rom_addr        = ic_m_addr;
+
+  // I-side to RAM arbiter path when not ROM
+  wire        i_req_arb  = ic_m_req & ~rom_sel;
+  wire [31:0] i_addr_arb = ic_m_addr;
+  wire [31:0] i_rdata_arb;
+  wire        i_rvalid_arb;
+  wire        i_fault_arb;
+
+  // ---------------- D-side signals into shared RAM ------------------
+  wire        d_req_arb   = dmem.req;
+  wire        d_we_arb    = dmem.we;
+  wire [3:0]  d_be_arb    = dmem.be;
+  wire [31:0] d_addr_arb  = dmem.addr;
+  wire [31:0] d_wdata_arb = dmem.wdata;
+
+  // ---------------- Simple 2:1 arbiter for shared RAM ---------------
+  // Priority: I-side when requesting, else D-side
+  logic        m_req, m_we;
+  logic [3:0]  m_be;
+  logic [31:0] m_addr, m_wdata;
+  logic [31:0] m_rdata;
+  logic        m_rvalid, m_fault;
+
+  always_comb begin
+    // default
+    m_req   = 1'b0;
+    m_we    = 1'b0;
+    m_be    = 4'b0000;
+    m_addr  = 32'h0;
+    m_wdata = 32'h0;
+    // I-side takes priority
+    if (i_req_arb) begin
+      m_req   = 1'b1;
+      m_we    = 1'b0;
+      m_be    = 4'b0000;
+      m_addr  = i_addr_arb;
+      m_wdata = 32'h0;
+    end else if (d_req_arb) begin
+      m_req   = 1'b1;
+      m_we    = d_we_arb;
+      m_be    = d_be_arb;
+      m_addr  = d_addr_arb;
+      m_wdata = d_wdata_arb;
+    end
+  end
+
+  // Return paths to I and D
+  assign i_rdata_arb  = m_rdata;
+  assign i_rvalid_arb = m_rvalid & i_req_arb;
+  assign i_fault_arb  = m_fault  & i_req_arb;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dmem.rdata <= 32'h0;
+      dmem.done  <= 1'b0;
+      dmem.fault <= 1'b0;
+    end else begin
+      dmem.done  <= m_rvalid & d_req_arb;
+      if (m_rvalid & d_req_arb & ~d_we_arb) begin
+        dmem.rdata <= m_rdata;
+      end
+      dmem.fault <= m_fault & d_req_arb;
+    end
+  end
+
+  // ------------------- Boot ROM instance ----------------------------
+  simple_bootrom #(.WORDS(ROM_BYTES/4)) u_bootrom (
+    .clk(clk), .rst_n(rst_n),
+    .req(rom_req), .addr(rom_addr),
+    .rdata(rom_rdata), .rvalid(rom_rvalid), .fault(rom_fault)
+  );
+
+  // ------------------- Shared RAM instance --------------------------
+  simple_ram #(.WORDS(16384)) u_ram (
+    .clk(clk), .rst_n(rst_n),
+    .req(m_req), .we(m_we), .be(m_be),
+    .addr(m_addr), .wdata(m_wdata),
+    .rdata(m_rdata), .rvalid(m_rvalid), .fault(m_fault)
+  );
+
+  // ------------------- I-side return mux (ROM vs RAM) ---------------
+  assign imem.rdata  = rom_sel ? rom_rdata  : i_rdata_arb;
+  assign imem.rvalid = rom_sel ? rom_rvalid : i_rvalid_arb;
+  assign imem.fault  = rom_sel ? rom_fault  : i_fault_arb;
+
+  // ------------------- Debug/keep outputs ---------------------------
+  // Mark with keep so they don't get optimized away even if identical
+  (* keep = "true" *) logic [31:0] keep_ic_addr, keep_i_addr_arb, keep_dc_addr, keep_m_addr;
+  (* keep = "true" *) logic        keep_ic_req,  keep_i_req_arb,  keep_dc_req,  keep_m_req;
+  (* keep = "true" *) logic [31:0] keep_imem_rdata, keep_dmem_rdata, keep_m_rdata;
+  (* keep = "true" *) logic        keep_imem_rvalid, keep_imem_fault, keep_dmem_done, keep_dmem_fault, keep_m_rvalid, keep_m_fault;
+  (* keep = "true" *) logic [31:0] keep_dmem_wdata;
+  (* keep = "true" *) logic  [3:0] keep_dmem_be;
+  (* keep = "true" *) logic        keep_dmem_we;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      {dbg_ic_addr, dbg_i_addr_arb, dbg_dc_addr, dbg_m_addr} <= '0;
+      {dbg_imem_rdata, dbg_dmem_rdata, dbg_m_rdata} <= '0;
+      {dbg_ic_req, dbg_i_req_arb, dbg_dc_req, dbg_m_req} <= '0;
+      {dbg_imem_rvalid, dbg_imem_fault, dbg_dmem_done, dbg_dmem_fault, dbg_m_rvalid, dbg_m_fault} <= '0;
+      {dbg_dmem_wdata, dbg_dmem_be} <= '0;
+      dbg_dmem_we <= 1'b0;
+
+      keep_ic_addr <= '0; keep_i_addr_arb <= '0; keep_dc_addr <= '0; keep_m_addr <= '0;
+      keep_imem_rdata <= '0; keep_dmem_rdata <= '0; keep_m_rdata <= '0;
+      keep_ic_req <= 1'b0; keep_i_req_arb <= 1'b0; keep_dc_req <= 1'b0; keep_m_req <= 1'b0;
+      keep_imem_rvalid <= 1'b0; keep_imem_fault <= 1'b0; keep_dmem_done <= 1'b0; keep_dmem_fault <= 1'b0; keep_m_rvalid <= 1'b0; keep_m_fault <= 1'b0;
+      keep_dmem_wdata <= '0; keep_dmem_be <= '0; keep_dmem_we <= 1'b0;
+    end else begin
+      // live taps
+      keep_ic_addr    <= ic_m_addr;    dbg_ic_addr    <= keep_ic_addr;
+      keep_ic_req     <= ic_m_req;     dbg_ic_req     <= keep_ic_req;
+      keep_i_addr_arb <= i_addr_arb;   dbg_i_addr_arb <= keep_i_addr_arb;
+      keep_i_req_arb  <= i_req_arb;    dbg_i_req_arb  <= keep_i_req_arb;
+
+      keep_imem_rdata  <= imem.rdata;   dbg_imem_rdata  <= keep_imem_rdata;
+      keep_imem_rvalid <= imem.rvalid;  dbg_imem_rvalid <= keep_imem_rvalid;
+      keep_imem_fault  <= imem.fault;   dbg_imem_fault  <= keep_imem_fault;
+
+      keep_dc_addr    <= d_addr_arb;   dbg_dc_addr    <= keep_dc_addr;
+      keep_dc_req     <= d_req_arb;    dbg_dc_req     <= keep_dc_req;
+
+      keep_dmem_rdata <= dmem.rdata;   dbg_dmem_rdata <= keep_dmem_rdata;
+      keep_dmem_done  <= dmem.done;    dbg_dmem_done  <= keep_dmem_done;
+      keep_dmem_fault <= dmem.fault;   dbg_dmem_fault <= keep_dmem_fault;
+
+      keep_m_addr     <= m_addr;       dbg_m_addr     <= keep_m_addr;
+      keep_m_req      <= m_req;        dbg_m_req      <= keep_m_req;
+      keep_m_rdata    <= m_rdata;      dbg_m_rdata    <= keep_m_rdata;
+      keep_m_rvalid   <= m_rvalid;     dbg_m_rvalid   <= keep_m_rvalid;
+      keep_m_fault    <= m_fault;      dbg_m_fault    <= keep_m_fault;
+
+      keep_dmem_wdata <= d_wdata_arb;  dbg_dmem_wdata <= keep_dmem_wdata;
+      keep_dmem_be    <= d_be_arb;     dbg_dmem_be    <= keep_dmem_be;
+      keep_dmem_we    <= d_we_arb;     dbg_dmem_we    <= keep_dmem_we;
+    end
+  end
+endmodule
