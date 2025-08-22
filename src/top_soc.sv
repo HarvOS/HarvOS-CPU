@@ -38,7 +38,23 @@ module top_soc(
   harvos_imem_if imem();
   harvos_dmem_if dmem();
 
-  // Keep core hierarchy to reduce sweeping of internals (Yosys respects keep_hierarchy)
+  
+// Consolidate all DMA masters via dma_gateway → firewall
+harvos_dmem_if dma_mux(); // output of gateway, input to firewall
+// Additional internal hookpoints for future DMAs (currently unused)
+harvos_dmem_if dma_m1();
+harvos_dmem_if dma_m2();
+harvos_dmem_if dma_m3();
+
+dma_gateway u_dma_gw (
+  .clk(clk), .rst_n(rst_n),
+  .dma_m0(dma),     // external DMA port
+  .dma_m1(dma_m1),  // future hook
+  .dma_m2(dma_m2),  // future hook
+  .dma_m3(dma_m3),  // future hook
+  .dma_out(dma_mux)
+);
+// Keep core hierarchy to reduce sweeping of internals (Yosys respects keep_hierarchy)
     
   // --- Revised: simple MPU programming FSM (synth-friendly, no arrays/typedefs) ---
   // Define two constant regions for programming at boot.
@@ -228,7 +244,7 @@ harvos_core u_core (
 
   end
 
-// --- DMA firewall ---
+  // DMA firewall
 // Parameters: ROM window = 16 KiB (boot ROM). No privileged regions by default.
 logic        dma_fw_req;
 logic        dma_fw_we;
@@ -239,7 +255,9 @@ logic [31:0] dma_fw_wdata;
 harvos_dma_firewall u_dma_fw (
   .clk   (clk),
   .rst_n (rst_n),
-  .dma   (dma),
+  // cfg tied-off (can be MMIO-mapped later)
+  .cfg_en(1'b0), .cfg_we(1'b0), .cfg_addr(4'h0), .cfg_wdata(32'h0), .cfg_be(4'h0), .cfg_rdata(),
+  .dma   (dma_mux),
 
   .fw_req   (dma_fw_req),
   .fw_we    (dma_fw_we),
@@ -280,7 +298,6 @@ always_comb begin
     m_wdata = dma_fw_wdata;
   end
 end
-
 
   // Track current owner of the memory request to route responses correctly
   typedef enum logic [1:0] {OWN_NONE, OWN_I, OWN_D, OWN_DMA} owner_e;

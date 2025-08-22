@@ -33,6 +33,14 @@ module harvos_dma_firewall #(
   input  logic clk,
   input  logic rst_n,
 
+  // simple config port (tie off if unused)
+  input  logic        cfg_en,
+  input  logic        cfg_we,
+  input  logic [3:0]  cfg_addr,
+  input  logic [31:0] cfg_wdata,
+  input  logic [3:0]  cfg_be,
+  output logic [31:0] cfg_rdata,
+
   // Incoming DMA master
   harvos_dmem_if.slave  dma,
 
@@ -49,13 +57,59 @@ module harvos_dma_firewall #(
   input  logic         m_fault
 );
 
+// Configuration registers (reset from parameters)
+reg [31:0] rom_bytes_q;   // I-space limit
+reg [31:0] pbase0_q;
+reg [31:0] pmask0_q;
+reg        pwrite_only0_q;
+reg        lock_q;
+
+// Write enable respecting lock
+wire cfg_we_unlocked = cfg_en && cfg_we && !lock_q;
+
+// Register write
+always @(posedge clk or negedge rst_n) begin
+  if (!rst_n) begin
+    rom_bytes_q    <= ROM_BYTES[31:0];
+    pbase0_q       <= PBASE0;
+    pmask0_q       <= PMASK0;
+    pwrite_only0_q <= PWRITE_ONLY0;
+    lock_q         <= 1'b0;
+  end else begin
+    if (cfg_we_unlocked) begin
+      case (cfg_addr)
+        4'h0: begin // CONTROL
+          if (cfg_wdata[0]) lock_q <= 1'b1; // LOCK is sticky
+        end
+        4'h1: rom_bytes_q    <= cfg_wdata;
+        4'h2: pbase0_q       <= cfg_wdata;
+        4'h3: pmask0_q       <= cfg_wdata;
+        4'h4: pwrite_only0_q <= cfg_wdata[0];
+        default: ;
+      endcase
+    end
+  end
+end
+
+// Readback
+always @* begin
+  case (cfg_addr)
+    4'h0: cfg_rdata = {31'b0, lock_q};
+    4'h1: cfg_rdata = rom_bytes_q;
+    4'h2: cfg_rdata = pbase0_q;
+    4'h3: cfg_rdata = pmask0_q;
+    4'h4: cfg_rdata = {31'b0, pwrite_only0_q};
+    default: cfg_rdata = 32'h0;
+  endcase
+end
+
   // Address classification
-  wire is_i_space     = (dma.addr < ROM_BYTES);
-  wire is_priv0_hit   = ((dma.addr & ~PMASK0) == PBASE0);
+  wire is_i_space     = (dma.addr < rom_bytes_q);
+  wire is_priv0_hit   = ((dma.addr & ~pmask0_q) == pbase0_q);
 
   // Privileged region block conditions
-  wire priv_block_read  = is_priv0_hit & (~PWRITE_ONLY0);
-  wire priv_block_write = is_priv0_hit & (PWRITE_ONLY0 | (~PWRITE_ONLY0));
+  wire priv_block_read  = is_priv0_hit & (~pwrite_only0_q);
+  wire priv_block_write = is_priv0_hit & (pwrite_only0_q | (~pwrite_only0_q));
 
   // Final block decision
   wire block_now = (dma.we & is_i_space) |

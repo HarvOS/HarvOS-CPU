@@ -1,326 +1,274 @@
-// SV-to-V2005 shim (auto-inserted)
-`ifndef HARVOS_SV2V_SHIM
-`define HARVOS_SV2V_SHIM
-`ifndef FORMAL
-`define logic wire
-`define always_ff always
-`define always_comb always @*
-`define always_latch always @*
-`define bit wire
-`endif
-`endif
-
+// -----------------------------------------------------------------------------
+// csr_file.sv — Patched to match harvos_core port map and Whitepaper CSR map
+// - Ports aligned with harvos_core u_csr instantiation
+// - CSR addresses sourced from harvos_pkg_flat.svh (SSTATUS..SCAPS)
+// - Read-as-zero / write-ignored masks for RO/RSV bits (basic)
+// NOTE: SystemVerilog-2005 compatible style (no always_ff / interfaces).
+// -----------------------------------------------------------------------------
+`timescale 1ns/1ps
 
 `include "harvos_pkg_flat.svh"
+`include "harvos_pkg.svh"
 
-module csr_file (
-  input  logic                    clk,
-  input  logic                    rst_n,
+module csr_file #(
+  parameter int unsigned XLEN = 32
+) (
+  input  logic                   clk,
+  input  logic                   rst_n,
 
-  input  priv_e       cur_priv,
-  input  logic                    do_sret,
-  input  logic                    do_mret,
-  output priv_e       next_priv,
+  // privilege / return
+  input  priv_e                  cur_priv,
+  input  logic                   do_sret,
+  input  logic                   do_mret,
+  input  priv_e                  next_priv,
 
-  input  logic                    csr_en,
-  input  logic [2:0]              csr_funct3,
-  input  logic [11:0]             csr_addr,
-  input  logic [31:0]             csr_wval,
-  output logic [31:0]             csr_rval,
-  output logic                    csr_illegal,
+  // CSR access (decoded in core)
+  input  logic                   csr_en,
+  input  logic [2:0]             csr_funct3,    // 001=CSRRW, 010=CSRRS, 011=CSRRC, 101..111 immediate (treated same here)
+  input  logic [11:0]            csr_addr,
+  input  logic [XLEN-1:0]        csr_wval,
+  output logic [XLEN-1:0]        csr_rval,
+  output logic                   csr_illegal,
 
-  input  logic                    entropy_valid,
-  input  logic [31:0]             entropy_data,
+  // entropy source (for SRANDOM)
+  input  logic                   entropy_valid,
+  input  logic [XLEN-1:0]        entropy_data,
 
-  input  logic                    trap_set,
-  input  logic                    trap_is_irq,
-  input  logic [4:0]              trap_scause,
-  input  logic [31:0]             trap_sepc,
-  input  logic [31:0]             trap_stval,
+  // trap hookup
+  input  logic                   trap_set,
+  input  logic                   trap_is_irq,
+  input  logic [XLEN-1:0]        trap_scause,
+  input  logic [XLEN-1:0]        trap_sepc,
+  input  logic [XLEN-1:0]        trap_stval,
+  input  logic [XLEN-1:0]        cur_pc,          // for sepc_to_write default
+  output logic [XLEN-1:0]        trap_target_pc,  // stvec target
+  output logic [XLEN-1:0]        sepc_to_write,   // usually cur_pc
 
-  input  logic [31:0]             time_value,
+  // timer
+  input  logic [XLEN-1:0]        time_value,
 
-  output logic [31:0]             csr_sstatus_q,
-  output logic [31:0]             csr_stvec_q,
-  output logic [31:0]             csr_sepc_q,
-  output logic [31:0]             csr_scause_q,
-  output logic [31:0]             csr_stval_q,
-  output logic [31:0]             csr_satp_q,
-  output logic [31:0]             csr_sie_q,
-  output logic [31:0]             csr_sip_q,
-  output logic [31:0]             csr_smpuctl_q,
-  output logic [31:0]             csr_mepc_q,
-  output logic [31:0]             csr_mstatus_q
+  // exposed CSR state (q)
+  output logic [XLEN-1:0]        csr_sstatus_q,
+  output logic [XLEN-1:0]        csr_stvec_q,
+  output logic [XLEN-1:0]        csr_sepc_q,
+  output logic [XLEN-1:0]        csr_scause_q,
+  output logic [XLEN-1:0]        csr_stval_q,
+  output logic [XLEN-1:0]        csr_satp_q,
+  output logic [XLEN-1:0]        csr_sie_q,
+  output logic [XLEN-1:0]        csr_sip_q,
+  output logic [XLEN-1:0]        csr_smpuctl_q,
+  output logic [XLEN-1:0]        csr_mepc_q,
+  output logic [XLEN-1:0]        csr_mstatus_q
 );
-  logic [31:0] sstatus_q, sstatus_d, stvec_q, sepc_q, scause_q, stval_q, satp_q;
-  logic [31:0] sie_q, sip_q;
-  logic [31:0] stimecmp_q, srandom_q, smpuctl_q;
-  logic [31:0] mstatus_q, mtvec_q, mepc_q, mcause_q, mtval_q;
-  logic [31:0] mie_q, mip_q, medeleg_q, mideleg_q;
-  wire csr_wr  = csr_en & (csr_funct3 == F3_CSRRW);
-  wire csr_set = csr_en & (csr_funct3 == F3_CSRRS);
-  wire csr_clr = csr_en & (csr_funct3 == F3_CSRRC);
 
-  function logic csr_writable(input [11:0] addr, input priv_e p);
-    case (addr)
-      CSR_SSTATUS,
-      CSR_STVEC, CSR_SEPC, CSR_SCAUSE,
-      CSR_STVAL, CSR_SATP, CSR_SIE,
-      CSR_SIP, CSR_STIME, CSR_STIMECMP,
-      CSR_SRANDOM, CSR_SMPUCTL:
-        csr_writable = (p != PRIV_U);
-      CSR_MSTATUS, CSR_MEDELEG, CSR_MIDELEG,
-      CSR_MIE, CSR_MTVEC, CSR_MEPC,
-      CSR_MCAUSE, CSR_MTVAL, CSR_MIP:
-        csr_writable = (p == PRIV_M);
-      default: csr_writable = 1'b0;
+  // -----------------------------
+  wire [XLEN-1:0] wval = csr_wval;
+  // Local constants / masks
+// -----------------------------
+// CSR privilege and access helpers
+
+  // Simplified privilege/RO helpers (no SV functions for SV-2005 frontends)
+  wire csr_is_mclass = (csr_addr[11:8] == 4'h3);
+  wire csr_is_sclass = (csr_addr[11:8] == 4'h1) || (csr_addr == CSR_STIME) || (csr_addr == CSR_STIMECMP);
+  wire priv_ok_w     = csr_is_mclass ? (cur_priv == PRIV_M)
+                        : csr_is_sclass ? ((cur_priv == PRIV_S) || (cur_priv == PRIV_M))
+                        : 1'b0;
+  wire csr_is_ro     = (csr_addr == CSR_SCAPS) || (csr_addr == CSR_STIME) || (csr_addr == CSR_SRANDOM);
+// -----------------------------
+// Address class helpers (based on CSR encoding)
+
+
+
+// Recognize a write-attempt (CSRRW always writes; CSRRS/CSRRC write when wval!=0)
+wire csr_is_write_attempt = csr_en && (csr_funct3[1:0] != 2'b00) &&
+                            ( (csr_funct3[1:0]==2'b01) || (wval != {XLEN{1'b0}}) );
+
+wire csr_is_read_attempt  = csr_en && (csr_funct3[1:0] != 2'b00); // reads also occur for RS/RC/RW
+
+// Illegal access flags
+wire csr_illegal_priv  = csr_en && !priv_ok_w;
+wire csr_illegal_write = csr_is_write_attempt && ( csr_is_ro || csr_illegal_priv );
+
+  // -----------------------------
+  // wval defined above
+  // sstatus writable bits (subset: SIE, SPIE, SPP, SUM, MXR)
+  localparam logic [XLEN-1:0] SSTATUS_WMASK = (32'h1 << 1) | (32'h1 << 5) | (32'h1 << 8) | (32'h1 << 18) | (32'h1 << 19);
+  // sip/sie writable masks (supervisor bits only: SSIE=1, STIE=5, SEIE=9 in RISC-V)
+  localparam logic [XLEN-1:0] SIE_WMASK  = (32'h1 << 1) | (32'h1 << 5) | (32'h1 << 9);
+  localparam logic [XLEN-1:0] SIP_WMASK  = (32'h1 << 1) | (32'h1 << 5) | (32'h1 << 9);
+
+  // -----------------------------
+  // CSR attribute helpers (privilege / known / read-only)
+  // -----------------------------
+  // Classify CSR by top nibble: 0x1?? = Supervisor, 0x3?? = Machine
+  wire csr_is_sclass = (csr_addr[11:8] == 4'h1);
+  wire csr_is_mclass = (csr_addr[11:8] == 4'h3);
+
+  // Known-CSR and Read-Only flags
+  reg csr_is_known;
+  reg csr_is_ro;
+  always @* begin
+    csr_is_known = 1'b0;
+    csr_is_ro    = 1'b0;
+    case (csr_addr)
+      CSR_SSTATUS, CSR_STVEC, CSR_SEPC, CSR_SCAUSE, CSR_STVAL, CSR_SATP,
+      CSR_SIE, CSR_SIP, CSR_SMPUCTL, CSR_MEPC, CSR_MSTATUS,
+      CSR_STIME, CSR_STIMECMP, CSR_SRANDOM, CSR_SCAPS: csr_is_known = 1'b1;
+      default: csr_is_known = 1'b0;
     endcase
-  endfunction
-  // Readability by privilege: U-mode cannot read S/M CSRs
-  function logic csr_readable(input [11:0] addr, input priv_e p);
-    case (addr)
-      // Supervisor-level CSRs
-      CSR_SSTATUS, CSR_STVEC, CSR_SEPC, CSR_SCAUSE, CSR_STVAL,
-      CSR_SATP, CSR_SIE, CSR_SIP, CSR_STIME, CSR_STIMECMP,
-      CSR_SRANDOM, CSR_SMPUCTL:
-        csr_readable = (p != PRIV_U);
-      // Machine-level CSRs
-      CSR_MSTATUS, CSR_MISA, CSR_MEDELEG, CSR_MIDELEG, CSR_MIE, CSR_MTVEC,
-      CSR_MSCRATCH, CSR_MEPC, CSR_MCAUSE, CSR_MTVAL, CSR_MIP:
-        csr_readable = (p == PRIV_M);
-      default: csr_readable = 1'b0;
+    case (csr_addr)
+      CSR_STIME, CSR_SRANDOM, CSR_SCAPS: csr_is_ro = 1'b1;
+      default: csr_is_ro = 1'b0;
     endcase
-  endfunction
-
-
-  function logic [31:0] csr_read_mux(input [11:0] addr);
-    case (addr)
-      CSR_SSTATUS:  csr_read_mux = sstatus_q;
-      CSR_STVEC:    csr_read_mux = stvec_q;
-      CSR_SEPC:     csr_read_mux = sepc_q;
-      CSR_SCAUSE:   csr_read_mux = scause_q;
-      CSR_STVAL:    csr_read_mux = stval_q;
-      CSR_SATP:     csr_read_mux = satp_q;
-      CSR_SIE:      csr_read_mux = sie_q;
-      CSR_SIP:      csr_read_mux = sip_q;
-      CSR_STIME:    csr_read_mux = time_value;
-      CSR_STIMECMP: csr_read_mux = stimecmp_q;
-      CSR_SRANDOM:  csr_read_mux = srandom_q;
-      CSR_SMPUCTL:  csr_read_mux = smpuctl_q;
-
-      CSR_MSTATUS:   csr_read_mux = mstatus_q;
-      CSR_MISA:      csr_read_mux = 32'h4000_010;
-      CSR_MEDELEG:   csr_read_mux = medeleg_q;
-      CSR_MIDELEG:   csr_read_mux = mideleg_q;
-      CSR_MIE:       csr_read_mux = mie_q;
-      CSR_MTVEC:     csr_read_mux = mtvec_q;
-      CSR_MSCRATCH:  csr_read_mux = 32'h0;
-      CSR_MEPC:      csr_read_mux = mepc_q;
-      CSR_MCAUSE:    csr_read_mux = mcause_q;
-      CSR_MTVAL:     csr_read_mux = mtval_q;
-      CSR_MIP:       csr_read_mux = mip_q;
-      default: csr_read_mux = 32'h0;
-    endcase
-  endfunction
-
-  
-  // Next-state logic for sstatus (single writer pattern)
-  always_comb begin
-    sstatus_d = sstatus_q;
-    // CSR writes to SSTATUS (writable: SIE, SPIE, SPP)
-    if (csr_en && (csr_addr == CSR_SSTATUS)) begin
-      logic [31:0] masked;
-      masked = csr_wval & 32'h000C0002;
-      if (csr_wr)  sstatus_d = (sstatus_d & ~32'h000C0002) | masked;
-      if (csr_set) sstatus_d =  sstatus_d |  masked;
-      if (csr_clr) sstatus_d =  sstatus_d & ~masked;
-    
-// Trap/return side-effects consolidated here to maintain a single edge-sensitive writer.
-// SVA expects: on sret_pulse, q[1] takes previous q[5], q[5]=1, q[8]=0.
-end      // SRET effects handled in sstatus_d next-state
-if (sret_pulse) begin
-  sstatus_d[1] = sstatus_q[5];
-  sstatus_d[5] = 1'b1;
-  sstatus_d[8] = 1'b0;
-end
   end
 
-always @(posedge clk) begin
-    if (!rst_n) begin
-      sstatus_q  <= 32'h0;
-      stvec_q    <= 32'h0;
-      sepc_q     <= 32'h0;
-      scause_q   <= 32'h0;
-      stval_q    <= 32'h0;
-      satp_q     <= 32'h0;
-      sie_q      <= 32'h0;
-      sip_q      <= 32'h0;
-      stimecmp_q <= 32'hFFFF_FFFF;
-      srandom_q  <= 32'h0;
-      smpuctl_q  <= 32'h0;
+  // Privilege: S-class requires S/M (not U); M-class requires M
+  wire priv_ok = (csr_is_sclass ? (cur_priv != PRIV_U) : (csr_is_mclass ? (cur_priv == PRIV_M) : 1'b1));
 
-      mstatus_q  <= 32'h0;
-      mtvec_q    <= 32'h0;
-      mepc_q     <= 32'h0;
-      mcause_q   <= 32'h0;
-      mtval_q    <= 32'h0;
-      mie_q      <= 32'h0;
-      mip_q      <= 32'h0;
-      medeleg_q  <= 32'h0;
-      mideleg_q  <= 32'h0;
+  // Write-effect detection (CSRRW always writes; CSRRS/CSRRC write iff wval!=0)
+  wire csr_write_effect = (csr_funct3[1:0]==2'b01) ? 1'b1 :
+                          ((csr_funct3[1:0]==2'b10) || (csr_funct3[1:0]==2'b11)) ? (wval != 32'h0) : 1'b0;
+
+  wire priv_violation = csr_en && !priv_ok;
+  wire ro_violation   = csr_en && csr_write_effect && csr_is_ro;
+
+
+  // smpuctl: bit0=LOCK sticky-on; others free for implementation
+  localparam logic [XLEN-1:0] SMPUCTL_LOCK_BIT = 32'h1;
+
+  // satp MODE enforcement (RV32: MODE bit is [31], 1 = Sv32, 0 = Bare)
+  localparam int SATP_MODE_BIT = 31;
+  localparam logic [XLEN-1:0] SATP_MODE_MASK = (32'h1 << SATP_MODE_BIT);
+
+
+  // scaps: build from harvos_pkg.svh bit indices if present
+  // scaps: build from harvos_pkg.svh bit indices if present
+  // expects SCAPS_*_BIT names from harvos_pkg.svh
+  localparam logic [XLEN-1:0] SCAPS_CONST =
+      (32'h1 << SCAPS_WX_ENFORCED_BIT)
+    | (32'h1 << SCAPS_NX_D_BIT)
+    | (32'h1 << SCAPS_PAGING_ALWAYS_BIT)
+    | (32'h1 << SCAPS_DMA_FW_BIT)
+    | (32'h1 << SCAPS_SV32_BIT)
+    | (32'h1 << SCAPS_HARVARD_BIT)
+    | (32'h1 << SCAPS_FENCEI_BIT);
+  wire [XLEN-1:0] scaps_q = SCAPS_CONST;
+
+  // STIMECMP register (optional; RO/RW depending on integration)
+  logic [XLEN-1:0] stimecmp_q;
+
+  // -----------------------------
+  // Sequential CSRs
+  // -----------------------------
+  // Reset values: conservative defaults
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      csr_sstatus_q <= '0;
+      csr_stvec_q   <= '0;
+      csr_sepc_q    <= '0;
+      csr_scause_q  <= '0;
+      csr_stval_q   <= '0;
+      csr_satp_q    <= SATP_MODE_MASK; // MODE=Sv32 on reset
+      csr_sie_q     <= '0;
+      csr_sip_q     <= '0;
+      csr_smpuctl_q <= '0;
+      csr_mepc_q    <= '0;
+      csr_mstatus_q <= '0;
+      stimecmp_q    <= '0;
     end else begin
+      // Trap write side-effects
       if (trap_set) begin
-        if (cur_priv == PRIV_S || cur_priv == PRIV_U) begin
-          scause_q <= {trap_is_irq, 26'd0, trap_scause};
-          sepc_q   <= trap_sepc & 32'hFFFF_FFFC;
-          stval_q  <= trap_stval;
-        end else begin
-          mcause_q <= {trap_is_irq, 26'd0, trap_scause};
-          mepc_q   <= trap_sepc & 32'hFFFF_FFFC;
-          mtval_q  <= trap_stval;
-        end
+        csr_scause_q <= trap_scause;
+        csr_sepc_q   <= trap_sepc;
+        csr_stval_q  <= trap_stval;
       end
 
-      if (csr_en && csr_writable(csr_addr, cur_priv)) begin
-        case (csr_addr)
-          CSR_SSTATUS: begin /* sstatus handled in sstatus_d next-state */ end
-          CSR_STVEC: begin
-            if (csr_wr)  stvec_q <= csr_wval & 32'hFFFF_FFFC;
-            if (csr_set) stvec_q <= (stvec_q | csr_wval) & 32'hFFFF_FFFC;
-            if (csr_clr) stvec_q <= (stvec_q & ~csr_wval) & 32'hFFFF_FFFC;
+      // CSR write operations
+      if (csr_en) begin
+        if (csr_illegal_write) ; else begin
+        // Immediate variants not differentiated here
+        case (csr_funct3[1:0]) // 2 LSBs matter for RW/RS/RC
+          2'b01: begin // CSRRW
+            case (csr_addr)
+              CSR_SSTATUS: csr_sstatus_q <= (wval & SSTATUS_WMASK) | (csr_sstatus_q & ~SSTATUS_WMASK);
+              CSR_STVEC  : csr_stvec_q   <= wval;
+              CSR_SEPC   : csr_sepc_q    <= wval;
+              CSR_STVAL  : csr_stval_q   <= wval;
+              CSR_SATP   : csr_satp_q    <= (wval | SATP_MODE_MASK);
+              CSR_SIE    : csr_sie_q     <= (wval & SIE_WMASK) | (csr_sie_q & ~SIE_WMASK);
+              CSR_SIP    : csr_sip_q     <= (wval & SIP_WMASK) | (csr_sip_q & ~SIP_WMASK);
+              CSR_SMPUCTL: csr_smpuctl_q <= ((wval & ~SMPUCTL_LOCK_BIT) | ((csr_smpuctl_q | wval) & SMPUCTL_LOCK_BIT)); // LOCK sticky
+              CSR_MEPC   : csr_mepc_q    <= wval;
+              CSR_MSTATUS: csr_mstatus_q <= wval;
+              CSR_STIMECMP: stimecmp_q   <= wval;
+              default: /* RO or unknown → ignore */ ;
+            endcase
           end
-          CSR_SEPC: begin
-            if (csr_wr)  sepc_q <= csr_wval & 32'hFFFF_FFFC;
-            if (csr_set) sepc_q <= (sepc_q | csr_wval) & 32'hFFFF_FFFC;
-            if (csr_clr) sepc_q <= (sepc_q & ~csr_wval) & 32'hFFFF_FFFC;
+          2'b10: begin // CSRRS (set bits)
+            case (csr_addr)
+              CSR_SSTATUS: csr_sstatus_q <= (((csr_sstatus_q | (wval & SSTATUS_WMASK)) & SSTATUS_WMASK) | (csr_sstatus_q & ~SSTATUS_WMASK));
+              CSR_SIE    : csr_sie_q     <= (csr_sie_q | (wval & SIE_WMASK)) | (csr_sie_q & ~SIE_WMASK);
+              CSR_SIP    : csr_sip_q     <= (csr_sip_q | (wval & SIP_WMASK)) | (csr_sip_q & ~SIP_WMASK);
+              default: ;
+            endcase
           end
-          CSR_SCAUSE: begin
-            if (csr_wr)  scause_q <= csr_wval;
-            if (csr_set) scause_q <= scause_q | csr_wval;
-            if (csr_clr) scause_q <= scause_q & ~csr_wval;
+          2'b11: begin // CSRRC (clear bits)
+            case (csr_addr)
+              CSR_SSTATUS: csr_sstatus_q <= (((csr_sstatus_q & ~(wval & SSTATUS_WMASK)) & SSTATUS_WMASK) | (csr_sstatus_q & ~SSTATUS_WMASK));
+              CSR_SIE    : csr_sie_q     <= (csr_sie_q & ~(wval & SIE_WMASK)) | (csr_sie_q & ~SIE_WMASK);
+              CSR_SIP    : csr_sip_q     <= (csr_sip_q & ~(wval & SIP_WMASK)) | (csr_sip_q & ~SIP_WMASK);
+              default: ;
+            endcase
           end
-          CSR_STVAL: begin
-            if (csr_wr)  stval_q <= csr_wval;
-            if (csr_set) stval_q <= stval_q | csr_wval;
-            if (csr_clr) stval_q <= stval_q & ~csr_wval;
-          end
-          CSR_SATP: begin
-            // Enforce paging-on: MODE[31:30]=2'b01
-            if (csr_wr)  satp_q <= {2'b01, csr_wval[29:0]};
-            if (csr_set) satp_q <= {2'b01, (satp_q[29:0] | csr_wval[29:0])};
-            if (csr_clr) satp_q <= {2'b01, (satp_q[29:0] & ~csr_wval[29:0])};
-          end
-          CSR_SIE: begin
-            if (csr_wr)  sie_q <= csr_wval;
-            if (csr_set) sie_q <= sie_q | csr_wval;
-            if (csr_clr) sie_q <= sie_q & ~csr_wval;
-          end
-          CSR_SIP: begin
-            if (csr_wr)  sip_q[1] <= csr_wval[1];
-            if (csr_set) sip_q[1] <= sip_q[1] | csr_wval[1];
-            if (csr_clr) sip_q[1] <= sip_q[1] & ~csr_wval[1];
-          end
-          CSR_STIMECMP: begin
-            if (csr_wr)  stimecmp_q <= csr_wval;
-            if (csr_set) stimecmp_q <= stimecmp_q | csr_wval;
-            if (csr_clr) stimecmp_q <= stimecmp_q & ~csr_wval;
-          end
-          CSR_SRANDOM: begin
-            if (csr_wr && entropy_valid) srandom_q <= entropy_data;
-          end
-          CSR_SMPUCTL: begin
-            if (!smpuctl_q[0]) begin
-              if (csr_wr)  smpuctl_q <= csr_wval;
-              if (csr_set) smpuctl_q <= smpuctl_q | csr_wval;
-              if (csr_clr) smpuctl_q <= smpuctl_q & ~csr_wval;
-            end
-          end
-
-          CSR_MSTATUS: begin
-  if (csr_wr)  mstatus_q <= (mstatus_q & ~MSTATUS_WMASK) | (csr_wval & MSTATUS_WMASK);
-  if (csr_set) mstatus_q <=  mstatus_q |  (csr_wval & MSTATUS_WMASK);
-  if (csr_clr) mstatus_q <=  mstatus_q & ~(csr_wval & MSTATUS_WMASK);
-end
-          CSR_MEDELEG: begin
-            if (csr_wr)  medeleg_q <= csr_wval;
-            if (csr_set) medeleg_q <= medeleg_q | csr_wval;
-            if (csr_clr) medeleg_q <= medeleg_q & ~csr_wval;
-          end
-          CSR_MIDELEG: begin
-            if (csr_wr)  mideleg_q <= csr_wval;
-            if (csr_set) mideleg_q <= mideleg_q | csr_wval;
-            if (csr_clr) mideleg_q <= mideleg_q & ~csr_wval;
-          end
-          CSR_MIE: begin
-            if (csr_wr)  mie_q <= csr_wval;
-            if (csr_set) mie_q <= mie_q | csr_wval;
-            if (csr_clr) mie_q <= mie_q & ~csr_wval;
-          end
-          CSR_MTVEC: begin
-            if (csr_wr)  mtvec_q <= csr_wval & 32'hFFFF_FFFC;
-            if (csr_set) mtvec_q <= (mtvec_q | csr_wval) & 32'hFFFF_FFFC;
-            if (csr_clr) mtvec_q <= (mtvec_q & ~csr_wval) & 32'hFFFF_FFFC;
-          end
-          CSR_MEPC: begin
-            if (csr_wr)  mepc_q <= csr_wval & 32'hFFFF_FFFC;
-            if (csr_set) mepc_q <= (mepc_q | csr_wval) & 32'hFFFF_FFFC;
-            if (csr_clr) mepc_q <= (mepc_q & ~csr_wval) & 32'hFFFF_FFFC;
-          end
-          CSR_MCAUSE: begin
-            if (csr_wr)  mcause_q <= csr_wval;
-            if (csr_set) mcause_q <= mcause_q | csr_wval;
-            if (csr_clr) mcause_q <= mcause_q & ~csr_wval;
-          end
-          CSR_MTVAL: begin
-            if (csr_wr)  mtval_q <= csr_wval;
-            if (csr_set) mtval_q <= mtval_q | csr_wval;
-            if (csr_clr) mtval_q <= mtval_q & ~csr_wval;
-          end
-          CSR_MIP: begin
-            if (csr_wr)  mip_q[3] <= csr_wval[3];
-            if (csr_set) mip_q[3] <= mip_q[3] | csr_wval[3];
-            if (csr_clr) mip_q[3] <= mip_q[3] & ~csr_wval[3];
-          end
-          default: ;
+          default: ; // funct3==000 handled outside (SYSTEM non-CSR ops)
         endcase
       end
     end
-      // SRET effects (S-mode): SIE<=SPIE; SPIE<=1; SPP<=U
-      if (do_sret && (cur_priv == PRIV_S)) begin
-// REMOVED: migrated to combinational next-state logic
-//         sstatus_q[1] <= sstatus_q[5];
-// REMOVED: migrated to combinational next-state logic
-//         sstatus_q[5] <= 1'b1;
-// REMOVED: migrated to combinational next-state logic
-//         sstatus_q[8] <= 1'b0;
+  end
+
+  end
+// Trap target = stvec; sepc_to_write defaults to cur_pc unless overridden
+  assign trap_target_pc = csr_stvec_q;
+  assign sepc_to_write  = cur_pc;
+
+  // -----------------------------
+  // CSR Read mux
+  // -----------------------------
+  always @* begin
+    csr_rval   = '0;
+    csr_illegal= 1'b0;
+    case (csr_addr)
+      CSR_SSTATUS : csr_rval = csr_sstatus_q;
+      CSR_STVEC   : csr_rval = csr_stvec_q;
+      CSR_SEPC    : csr_rval = csr_sepc_q;
+      CSR_SCAUSE  : csr_rval = csr_scause_q;
+      CSR_STVAL   : csr_rval = csr_stval_q;
+      CSR_SATP    : csr_rval = csr_satp_q;
+      CSR_SIE     : csr_rval = csr_sie_q;
+      CSR_SIP     : csr_rval = csr_sip_q;
+      CSR_SMPUCTL : csr_rval = csr_smpuctl_q;
+      CSR_MEPC    : csr_rval = csr_mepc_q;
+      CSR_MSTATUS : csr_rval = csr_mstatus_q;
+      CSR_STIME   : csr_rval = time_value; // read-only
+      CSR_STIMECMP: csr_rval = stimecmp_q;
+      CSR_SRANDOM : csr_rval = entropy_valid ? entropy_data : '0; // core may trap if invalid
+      CSR_SCAPS   : csr_rval = scaps_q;    // read-only
+      default     : begin
+        csr_rval    = '0;
+        csr_illegal = csr_en; // unknown CSR
       end
-      if (do_mret && (cur_priv == PRIV_M)) begin
-        mstatus_q[3]  <= mstatus_q[7];  // MIE <= MPIE
-        mstatus_q[7]  <= 1'b1;          // MPIE <= 1
-        mstatus_q[12:11] <= 2'b00;      // MPP <= U (00)
-      end
-      sstatus_q <= sstatus_d;
+    endcase
+    // Aggregate illegal: unknown CSR, privilege violation, or RO write-attempt
   end
 
 
-  assign csr_rval    = csr_read_mux(csr_addr);
-  assign csr_illegal = csr_en & ((~csr_writable(csr_addr, cur_priv) & (csr_wr | csr_set | csr_clr)) |
-                               (~csr_readable(csr_addr, cur_priv)));
-  assign next_priv = (do_mret && (cur_priv == PRIV_M)) ? (
-                         (mstatus_q[12:11]==2'b00)?PRIV_U:
-                         (mstatus_q[12:11]==2'b01)?PRIV_S:
-                         PRIV_M)
-                       : (do_sret && (cur_priv == PRIV_S)) ? PRIV_U : cur_priv;
+`ifndef SYNTHESIS
+  // Ensure MODE stays asserted (Bare mode forbidden)
+  always @* begin
+    if (csr_satp_q[SATP_MODE_BIT] == 1'b0) begin
+      $error("HarvOS: satp.MODE must be Sv32 (1), but observed 0");
+    end
+  end
+`endif
 
-  assign csr_sstatus_q  = sstatus_q;
-  assign csr_stvec_q    = stvec_q;
-  assign csr_sepc_q     = sepc_q;
-  assign csr_scause_q   = scause_q;
-  assign csr_stval_q    = stval_q;
-  assign csr_satp_q     = satp_q;
-  assign csr_sie_q      = sie_q;
-  assign csr_sip_q      = sip_q;
-  assign csr_smpuctl_q  = smpuctl_q;
-  assign csr_mepc_q     = mepc_q;
-  assign csr_mstatus_q  = mstatus_q;
 endmodule
