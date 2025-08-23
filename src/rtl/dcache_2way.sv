@@ -19,6 +19,7 @@ module dcache_2way #(
   input  logic        rst_n,
 
   // CPU side
+  input  logic [1:0] way_mask_i,  // ASID-based way mask (1=enabled)
   input  logic        cpu_req,
   input  logic        cpu_we,
   input  logic [3:0]  cpu_be,
@@ -124,15 +125,21 @@ localparam integer WORDS_PER_LINE = LINE_BYTES/4;
   wire [OFFSET_BITS-1:2] word_off = cpu_addr[OFFSET_BITS-1:2];
 
   // Hit detection
-  wire hit0 = tagv0_valid[index] && (tagv0_tag[index] == tag);
-  wire hit1 = tagv1_valid[index] && (tagv1_tag[index] == tag);
-  wire hit  = hit0 | hit1;
+  wire hit0_raw = tagv0_valid[index] && (tagv0_tag[index] == tag);
+  wire hit1_raw = tagv1_valid[index] && (tagv1_tag[index] == tag);
+  wire hit0     = hit0_raw & way_mask_i[0];
+  wire hit1     = hit1_raw & way_mask_i[1];
+  wire hit      = hit0 | hit1;
   wire [31:0] hit_word = hit0 ? data0[index][word_off] : data1[index][word_off];
 
-  // Victim choice
-  wire use_way0 = (~tagv0_valid[index]) ? 1'b1 :
-                  (~tagv1_valid[index]) ? 1'b0 :
-                  (lru[index] == 1'b0); // if way0 is LRU, replace way0
+  // Victim choice (mask-aware)
+  wire way0_ok = way_mask_i[0];
+  wire way1_ok = way_mask_i[1];
+  wire use_way0 = (~tagv0_valid[index] && way0_ok) ? 1'b1 :
+                  (~tagv1_valid[index] && way1_ok) ? 1'b0 :
+                  ( way0_ok && !way1_ok) ? 1'b1  :
+                  (!way0_ok &&  way1_ok) ? 1'b0  :
+                  (~lru[index]); // if way0 is LRU, replace way0
 
   // MSHR (1 outstanding)
   typedef struct packed {

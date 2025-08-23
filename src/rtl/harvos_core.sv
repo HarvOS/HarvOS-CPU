@@ -36,7 +36,15 @@ module harvos_core (
   input  logic [31:0]    mpu_prog_limit,
   input  logic [2:0]     mpu_prog_perm,  // {x,w,r}
   input  logic           mpu_prog_user_ok,
-  input  logic           mpu_prog_is_ispace
+  input  logic           mpu_prog_is_ispace,
+  // exported LOCK bit from smpuctl (sticky-on)
+  output logic            smpuctl_lock_o
+,
+  output logic            sfence_global_o,
+  output logic            asid_change_pulse_o,
+  // external sticky lock set from SoC
+  input  logic            lock_set_i,
+  input logic [1:0] dc_way_mask_i
 );
 
   // FENCE.I flush signal
@@ -206,7 +214,7 @@ module harvos_core (
   // SFENCE.VMA decode -> MMU/TLB flush controls
   wire        sfence_flush_all_w, sfence_addr_valid_w, sfence_asid_valid_w;
   wire [31:0] sfence_vaddr_w;
-  wire [8:0]  sfence_asid_w;
+  wire [15:0]  sfence_asid_w;
   sfence_vma_decode SFENCEVMA (
     .clk(clk), .rst_n(rst_n),
     .opcode(opcode_id), .funct3(funct3_id), .funct7(funct7_id),
@@ -219,6 +227,9 @@ module harvos_core (
     .sfence_asid_valid(sfence_asid_valid_w),
     .sfence_asid(sfence_asid_w)
   );
+  // Export global sfence for cache control
+  assign sfence_global_o = sfence_flush_all_w;
+
 
   // --- CSR decode & file (whitepaper compliance) ---
   // CSR op detection (register variants only)
@@ -244,7 +255,7 @@ module harvos_core (
   logic [31:0] csr_satp_q, csr_sie_q, csr_sip_q, csr_smpuctl_q, csr_mepc_q, csr_mstatus_q;
   priv_e       next_priv;
 
-  logic [31:0] csr_rval_dummy; logic csr_illegal_dummy;
+  logic [31:0] csr_rval; logic csr_illegal;
   csr_file u_csr (
     .clk(clk), .rst_n(rst_n),
     .cur_priv      (priv_q),
@@ -255,8 +266,8 @@ module harvos_core (
     .csr_funct3    (funct3_id),
     .csr_addr      (csr_addr_w),
     .csr_wval      (csr_wval_w),
-    .csr_rval      (csr_rval_dummy),
-    .csr_illegal   (csr_illegal_dummy),
+    .csr_rval      (csr_rval),
+    .csr_illegal   (csr_illegal),
     .entropy_valid (entropy_valid),
     .entropy_data  (entropy_data),
     // trap hookup
@@ -267,6 +278,7 @@ module harvos_core (
     .trap_stval    (trap_stval_q),
     // timer
     .time_value    (32'h0),
+    .lock_set_i    (lock_set_i),
     // outputs
     .csr_sstatus_q (csr_sstatus_q),
     .csr_stvec_q   (csr_stvec_q),
@@ -280,6 +292,25 @@ module harvos_core (
     .csr_mepc_q    (csr_mepc_q),
     .csr_mstatus_q (csr_mstatus_q)
   );
+
+  // Trap on illegal CSR access (incl. satp.MODE=BARE attempts)
+  always @* begin
+    if (csr_illegal && (opcode_id == OPC_SYSTEM) && (funct3_id != 3'b000)) begin
+      trap_request(SCAUSE_ILLEGAL_INSTR, {20'h0, csr_addr_w});
+    end
+  end
+  // Detect ASID changes to trigger per-context cache flush if configured
+  logic [15:0] asid_last_q;
+  wire  [15:0] asid_cur_w = csr_satp_q[29:14];
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      asid_last_q <= asid_cur_w;
+    end else begin
+      asid_last_q <= asid_cur_w;
+    end
+  end
+  assign asid_change_pulse_o = (asid_cur_w != asid_last_q);
+
 assign icache_flush = fencei_flush_pulse;
 // Privilege & core init
   always_ff @(posedge clk or negedge rst_n) begin
@@ -653,7 +684,7 @@ end
           if (if_ready) begin
             if_req <= 1'b0;
             if (if_fault || !if_perm_x || !mpu_allow_if) begin
-              if (!mpu_allow_d) begin trap_request((do_load_ex)?SCAUSE_LOAD_ACCESS_FAULT:SCAUSE_STORE_ACCESS_FAULT, alu_y_ex); lsu_n = LSU_IDLE; end else if (!mpu_is_ispace_if) trap_request(SCAUSE_HARVARD_VIOLATION, pc_q); else trap_request(SCAUSE_INST_ACCESS_FAULT, pc_q);
+              if (!mpu_allow_d) begin trap_request((do_load_ex)?SCAUSE_LOAD_ACCESS_FAULT:SCAUSE_STORE_ACCESS_FAULT, alu_y_ex); lsu_n = LSU_IDLE; end else if (!mpu_is_ispace_if) trap_request(SCAUSE_HARVARD_VIOLATION, pc_q); else trap_request((!mpu_allow_if)?SCAUSE_HARVARD_VIOLATION:SCAUSE_INST_ACCESS_FAULT, pc_q);
               if_state_q <= IF_IDLE;
             end else begin
               ic_cpu_req <= 1'b1; // via I$
@@ -669,7 +700,7 @@ end
         IF_WAIT: begin
           if (ic_cpu_rvalid) begin
             if (ic_cpu_fault) begin
-              if (!mpu_allow_d) begin trap_request((do_load_ex)?SCAUSE_LOAD_ACCESS_FAULT:SCAUSE_STORE_ACCESS_FAULT, alu_y_ex); lsu_n = LSU_IDLE; end else trap_request(SCAUSE_INST_ACCESS_FAULT, pc_q);
+              if (!mpu_allow_d) begin trap_request((do_load_ex)?SCAUSE_LOAD_ACCESS_FAULT:SCAUSE_STORE_ACCESS_FAULT, alu_y_ex); lsu_n = LSU_IDLE; end else trap_request((!mpu_allow_if)?SCAUSE_HARVARD_VIOLATION:SCAUSE_INST_ACCESS_FAULT, pc_q);
             end else begin
               if_instr <= ic_cpu_rdata;
               if (trap_pending_q) begin pc_q <= trap_target_pc; end else begin pc_q     <= pc_q + 32'd4; end // default advance

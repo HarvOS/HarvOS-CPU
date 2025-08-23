@@ -78,6 +78,11 @@ module mmu_sv32 (
   reg [15:0]        itlb_asid [0:TLB_ENTRIES-1];
   reg [19:0]        itlb_vpn  [0:TLB_ENTRIES-1]; // {vpn1,vpn0}
   reg [21:0]        itlb_ppn  [0:TLB_ENTRIES-1]; // PPN from leaf
+
+  // ---- HarvOS Harvard-Alias invariant (inline CAM of exec PPNs) ----
+  reg [19:0] exec_ppn_cam [0:15];
+  reg        exec_ppn_v   [0:15];
+  reg [3:0]  exec_wr_ptr;
   reg               itlb_p_r  [0:TLB_ENTRIES-1];
   reg               itlb_p_w  [0:TLB_ENTRIES-1];
   reg               itlb_p_x  [0:TLB_ENTRIES-1];
@@ -95,6 +100,19 @@ module mmu_sv32 (
   reg               dtlb_p_u  [0:TLB_ENTRIES-1];
   reg               dtlb_p_a  [0:TLB_ENTRIES-1];
   reg               dtlb_p_d  [0:TLB_ENTRIES-1];
+
+`ifndef SYNTHESIS
+  // ---- Whitepaper invariants (runtime checks) ----
+  genvar gi;
+  generate
+    for (gi=0; gi<TLB_ENTRIES; gi=gi+1) begin: G_INV
+      // No page may be both writable and executable in TLB
+      assert (!(itlb_p_w[gi] && itlb_p_x[gi])) else $error("W^X violated in ITLB at %0d", gi);
+      assert (!(dtlb_p_w[gi] && dtlb_p_x[gi])) else $error("W^X violated in DTLB at %0d", gi);
+    end
+  endgenerate
+`endif
+
 
   // ===== SUM / MXR =====
   localparam SSTATUS_SUM_BIT = 18;
@@ -158,6 +176,18 @@ module mmu_sv32 (
   assign d_perm_w  = ~mode_bare & dtlb_hit & dtlb_perm_w & d_u_ok & dtlb_perm_a & dtlb_perm_d & (d_acc==2'b01);
   assign d_perm_x  = 1'b0;
 
+
+  // Exec-hit for D-side physical address
+  wire [19:0] d_ppn = d_paddr[31:12];
+  reg exec_hit;
+  integer j;
+  always @* begin
+    exec_hit = 1'b0;
+    for (j=0;j<16;j=j+1) begin
+      if (exec_ppn_v[j] && exec_ppn_cam[j]==d_ppn) exec_hit = 1'b1;
+    end
+  end
+
   // faults
   wire if_fault_perm = itlb_hit & (~(itlb_perm_x & if_u_ok & itlb_perm_a));
   wire d_fault_perm  = dtlb_hit & (
@@ -175,7 +205,7 @@ module mmu_sv32 (
   wire d_harvard_fault = dtlb_hit & d_req & is_in_ispace(d_paddr);
 
   assign if_fault = mode_bare ? if_req : (if_req & ( (~itlb_hit) ? 1'b0 : if_fault_perm ));
-  assign d_fault  = mode_bare ? d_req  : (d_req  & ( (~dtlb_hit) ? 1'b0 : (d_fault_perm | d_harvard_fault) ));
+  assign d_fault  = mode_bare ? d_req  : (d_req  & ( (~dtlb_hit) ? 1'b0 : (d_fault_perm | d_harvard_fault | (dtlb_hit & d_req & (d_acc==2'b01) & exec_hit)) ));
 
   // ===== PTW walk =====
   // Compute PTE addresses
@@ -200,6 +230,10 @@ module mmu_sv32 (
   integer i;
   always @(posedge clk) begin
     if (rst_i) begin
+      // Alias CAM reset
+      for (i=0;i<16;i=i+1) begin exec_ppn_v[i] <= 1'b0; exec_ppn_cam[i] <= 20'h0; end
+      exec_wr_ptr <= 4'h0;
+
       w_state <= W_IDLE;
       w_is_if <= 1'b0;
       w_vaddr <= 32'b0;
@@ -215,6 +249,11 @@ module mmu_sv32 (
         itlb_v[i] <= 1'b0; dtlb_v[i] <= 1'b0;
       end
     end else begin
+      // Clear exec CAM on global sfence flush
+      if (sfence_flush_all) begin
+        for (i=0;i<16;i=i+1) exec_ppn_v[i] <= 1'b0;
+      end
+
       w_valid_resp <= 1'b0;
       // SFENCE handling
       if (sfence_flush_all) begin
@@ -275,7 +314,19 @@ module mmu_sv32 (
                     itlb_ppn[idx]  <= fill_ppn;
                     itlb_p_r[idx]  <= pte_r(ptw_rdata);
                     itlb_p_w[idx]  <= 1'b0; // R must be 1 if W=1
-                    itlb_p_x[idx]  <= pte_w(ptw_rdata) ? 1'b0 : pte_x(ptw_rdata); // W^X
+                    itlb_p_x[idx]  <= pte_w(ptw_rdata) ? 1'b0 : pte_x(ptw_rdata); 
+                                        // Alias CAM insert if executable
+                    begin : alias_ins
+                      reg [21:0] __ppn;
+                      __ppn = pte_ppn(ptw_rdata);
+                      if (pte_x(ptw_rdata) && ~pte_w(ptw_rdata)) begin
+                        exec_ppn_cam[exec_wr_ptr] <= __ppn[19:0];
+                        exec_ppn_v[exec_wr_ptr]   <= 1'b1;
+                        exec_wr_ptr               <= exec_wr_ptr + 4'h1;
+                      end
+                    end
+
+// W^X
                     itlb_p_u[idx]  <= pte_u(ptw_rdata);
                     itlb_p_a[idx]  <= pte_a(ptw_rdata);
                     itlb_p_d[idx]  <= pte_d(ptw_rdata);
@@ -324,7 +375,19 @@ module mmu_sv32 (
                     itlb_p_r[idx]  <= pte_r(ptw_rdata);
                     itlb_p_w[idx]  <= 1'b0;
                     itlb_p_x[idx]  <= pte_w(ptw_rdata) ? 1'b0 : pte_x(ptw_rdata);
-                    itlb_p_u[idx]  <= pte_u(ptw_rdata);
+                    
+                                        // Alias CAM insert if executable
+                    begin : alias_ins
+                      reg [21:0] __ppn;
+                      __ppn = pte_ppn(ptw_rdata);
+                      if (pte_x(ptw_rdata) && ~pte_w(ptw_rdata)) begin
+                        exec_ppn_cam[exec_wr_ptr] <= __ppn[19:0];
+                        exec_ppn_v[exec_wr_ptr]   <= 1'b1;
+                        exec_wr_ptr               <= exec_wr_ptr + 4'h1;
+                      end
+                    end
+
+itlb_p_u[idx]  <= pte_u(ptw_rdata);
                     itlb_p_a[idx]  <= pte_a(ptw_rdata);
                     itlb_p_d[idx]  <= pte_d(ptw_rdata);
                     itlb_p_a[idx]  <= pte_a(ptw_rdata);

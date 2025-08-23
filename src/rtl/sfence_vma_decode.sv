@@ -34,7 +34,7 @@ module sfence_vma_decode (
   output logic        sfence_addr_valid,
   output logic [31:0] sfence_vaddr,
   output logic        sfence_asid_valid,
-  output logic [8:0]  sfence_asid
+  output logic [15:0]  sfence_asid
 );
   // Detect SFENCE.VMA (RV32 privileged spec): opcode=SYSTEM (0x73), funct3=000, funct7=0001001 (0x09).
   wire is_sfence_vma = (opcode == OPC_SYSTEM) &&
@@ -56,7 +56,7 @@ module sfence_vma_decode (
   assign sfence_addr_valid = pulse & (rs1 != 5'd0);
   assign sfence_vaddr      = rs1_val;
   assign sfence_asid_valid = pulse & (rs2 != 5'd0);
-  assign sfence_asid       = rs2_val[8:0];
+  assign sfence_asid       = rs2_val[15:0];
   assign sfence_flush_all  = pulse & (rs1 == 5'd0) & (rs2 == 5'd0);
 
 endmodule

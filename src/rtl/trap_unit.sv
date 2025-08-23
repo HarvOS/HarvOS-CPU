@@ -25,6 +25,6 @@ module trap_unit (
 );
   // precise traps: record faulting PC, vector to stvec
   assign sepc_to_write   = cur_pc;
-  assign trap_target_pc  = csr_stvec_q; // aligned earlier
+  assign trap_target_pc  = {csr_stvec_q[31:2], 2'b00}; // force 4-byte alignment
 
 endmodule

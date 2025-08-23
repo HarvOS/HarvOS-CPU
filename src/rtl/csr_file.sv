@@ -47,6 +47,9 @@ module csr_file #(
   // timer
   input  logic [XLEN-1:0]        time_value,
 
+  // external sticky lock-set (from SoC boot)
+  input  logic                   lock_set_i,
+
   // exposed CSR state (q)
   output logic [XLEN-1:0]        csr_sstatus_q,
   output logic [XLEN-1:0]        csr_stvec_q,
@@ -140,6 +143,9 @@ wire csr_illegal_write = csr_is_write_attempt && ( csr_is_ro || csr_illegal_priv
   localparam int SATP_MODE_BIT = 31;
   localparam logic [XLEN-1:0] SATP_MODE_MASK = (32'h1 << SATP_MODE_BIT);
 
+// Flag a write-attempt that tries to set satp.MODE=BARE (forbidden)
+wire satp_bare_attempt = csr_is_write_attempt && (csr_addr==CSR_SATP) && (csr_wval[SATP_MODE_BIT]==1'b0);
+
 
   // scaps: build from harvos_pkg.svh bit indices if present
   // scaps: build from harvos_pkg.svh bit indices if present
@@ -191,13 +197,14 @@ wire csr_illegal_write = csr_is_write_attempt && ( csr_is_ro || csr_illegal_priv
           2'b01: begin // CSRRW
             case (csr_addr)
               CSR_SSTATUS: csr_sstatus_q <= (wval & SSTATUS_WMASK) | (csr_sstatus_q & ~SSTATUS_WMASK);
-              CSR_STVEC  : csr_stvec_q   <= wval;
+              CSR_STVEC  : csr_stvec_q   <= (wval & ~32'h3); // force 4-byte alignment
               CSR_SEPC   : csr_sepc_q    <= wval;
               CSR_STVAL  : csr_stval_q   <= wval;
+              // HarvOS: enforce MODE=Sv32 on write
               CSR_SATP   : csr_satp_q    <= (wval | SATP_MODE_MASK);
               CSR_SIE    : csr_sie_q     <= (wval & SIE_WMASK) | (csr_sie_q & ~SIE_WMASK);
               CSR_SIP    : csr_sip_q     <= (wval & SIP_WMASK) | (csr_sip_q & ~SIP_WMASK);
-              CSR_SMPUCTL: csr_smpuctl_q <= ((wval & ~SMPUCTL_LOCK_BIT) | ((csr_smpuctl_q | wval) & SMPUCTL_LOCK_BIT)); // LOCK sticky
+              CSR_SMPUCTL: csr_smpuctl_q <= ((wval & ~SMPUCTL_LOCK_BIT) | ((csr_smpuctl_q | wval | { {XLEN-1{1'b0}}, lock_set_i}) & SMPUCTL_LOCK_BIT)); // LOCK sticky incl. external set
               CSR_MEPC   : csr_mepc_q    <= wval;
               CSR_MSTATUS: csr_mstatus_q <= wval;
               CSR_STIMECMP: stimecmp_q   <= wval;
@@ -256,6 +263,7 @@ wire csr_illegal_write = csr_is_write_attempt && ( csr_is_ro || csr_illegal_priv
       default     : begin
         csr_rval    = '0;
         csr_illegal = csr_en; // unknown CSR
+        if (satp_bare_attempt) csr_illegal = 1'b1; // trap on BARE attempt
       end
     endcase
     // Aggregate illegal: unknown CSR, privilege violation, or RO write-attempt

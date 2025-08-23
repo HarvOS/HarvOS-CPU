@@ -27,6 +27,10 @@ module icache #(
   output logic [31:0]           cpu_rdata,
   output logic                  cpu_rvalid,
   output logic                  cpu_fault,
+  input  logic                  inv_all,
+  // Security: cache control
+  input  logic          inv_all,
+
 
   // Memory side (to external imem bus)
   harvos_imem_if.master         mem
@@ -134,6 +138,14 @@ localparam integer WORDS_PER_LINE = LINE_BYTES/4;
         for (j = 0; j < WORDS_PER_LINE; j++) data[i][j] <= 32'h0;
       end
     end else begin
+      // Invalidate-all on inv_all
+      if (inv_all) begin
+        integer k;
+        for (k=0;k<LINES;k=k+1) begin
+          tagv_valid[k] <= 1'b0;
+        end
+      end
+
       st_q <= st_n;
       fill_cnt_q <= fill_cnt_n;
 

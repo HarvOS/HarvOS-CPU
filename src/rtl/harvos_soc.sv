@@ -42,8 +42,17 @@ module harvos_soc (
     .mpu_prog_limit(32'h0),
     .mpu_prog_perm(3'b000),
     .mpu_prog_user_ok(1'b0),
-    .mpu_prog_is_ispace(1'b0)
+    .mpu_prog_is_ispace(1'b0),
+    .smpuctl_lock_o(smpuctl_lock),
+    .sfence_global_o(sfence_global),
+    .asid_change_pulse_o(asid_change_pulse),
+    .lock_set_i(1'b0)
   );
+
+    // exported lock bit
+  logic smpuctl_lock;
+  logic sfence_global;
+  logic asid_change_pulse;
 
   // I-Cache
   logic        ic_m_req;
@@ -74,6 +83,19 @@ module harvos_soc (
   logic [31:0] dc_m_addr, dc_m_wdata;
   logic [31:0] dc_m_rdata;
   logic        dc_m_rvalid, dc_m_fault;
+  // --- HarvOS: Cache security control (MMIO) + D$ invalidate wiring ---
+  // MMIO address for cache control
+  localparam logic [31:0] CACHE_CTRL_ADDR = 32'h1000_0100;
+  // Wires for MMIO hit/response
+  logic        cache_mmio_hit;
+  logic        cache_mmio_wr;
+  logic [31:0] cache_mmio_wdata;
+  logic [31:0] cache_mmio_rdata;
+  logic        cache_mmio_rvalid;
+  logic        cache_mmio_fault;
+  // D$ invalidate pulse
+  logic        dc_inv;
+
 
   dcache u_dcache (
     .clk(clk), .rst_n(rst_n),
@@ -94,7 +116,8 @@ module harvos_soc (
     .mem_wdata (dc_m_wdata),
     .mem_rdata (dc_m_rdata),
     .mem_rvalid(dc_m_rvalid),
-    .mem_fault (dc_m_fault)
+    .mem_fault (dc_m_fault),
+    .inv_all  (dc_inv)
   );
 
   // Arbiter -> RAM
@@ -117,12 +140,51 @@ module harvos_soc (
   wire         i_rvalid_arb;
   wire         i_fault_arb;
 
+  
+  // Cache security control MMIO block
+  // Generate flush request via manual MMIO writes; ASID/SFENCE pulses can be wired later if exported from core/CSR.
+  logic ic_flush_req_unused;
+  logic [3:0] ic_way_mask_unused;
+  cache_sec_ctrl #(.I_WAYS(1), .D_WAYS(1)) u_cache_ctrl (
+    .clk(clk), .rst_n(rst_n),
+    .asid_change_pulse(asid_change_pulse),         // TODO: wire from CSR if available
+    .sfence_global(sfence_global),             // TODO: wire from core if available
+    .lock_i(smpuctl_lock),                    // optionally drive from smpuctl.LOCK if exported
+    .wr_en(cache_mmio_hit && cache_mmio_wr),
+    .wr_data(cache_mmio_wdata),
+    .rd_data(cache_mmio_rdata),
+    .ic_flush_req(ic_flush_req_unused),
+    .dc_flush_req(/*out*/),
+    .ic_way_mask(ic_way_mask_unused),
+    .dc_way_mask() // unused for direct-mapped
+  );
+  wire dc_flush_req_w;
+  assign dc_flush_req_w = /* synthesis keep */ u_cache_ctrl.dc_flush_req;
+
+  // Stretch flush pulse to inv_all level
+  cache_flush_adapter #(.HOLD_CYCLES(8)) u_dc_flush (
+    .clk(clk), .rst_n(rst_n),
+    .flush_req(dc_flush_req_w),
+    .flush_ack(1'b0),
+    .flush_do(dc_inv)
+  );
+
+  // MMIO decode for cache_ctrl at D$ MEM side
+  assign cache_mmio_hit   = dc_m_req && (dc_m_addr == CACHE_CTRL_ADDR);
+  assign cache_mmio_wr    = dc_m_we;
+  assign cache_mmio_wdata = dc_m_wdata;
+
+  // Response mux for D$ MEM return
+  logic [31:0] dc_m_rdata_mem;
+  logic        dc_m_rvalid_mem;
+  logic        dc_m_fault_mem;
+
   mem_arbiter2 u_arb (
     .clk(clk), .rst_n(rst_n),
     // D$ master
-    .d_req(dc_m_req), .d_we(dc_m_we), .d_be(dc_m_be),
+    .d_req(dc_m_req && !cache_mmio_hit), .d_we(dc_m_we), .d_be(dc_m_be),
     .d_addr(dc_m_addr), .d_wdata(dc_m_wdata),
-    .d_rdata(dc_m_rdata), .d_rvalid(dc_m_rvalid), .d_fault(dc_m_fault),
+    .d_rdata(dc_m_rdata_mem), .d_rvalid(dc_m_rvalid_mem), .d_fault(dc_m_fault_mem),
     // I$ master (gated)
     .i_req(i_req_arb), .i_addr(i_addr_arb),
     .i_rdata(i_rdata_arb), .i_rvalid(i_rvalid_arb), .i_fault(i_fault_arb),

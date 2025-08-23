@@ -45,7 +45,7 @@ module ifetch_guard #(
   // Fault when a request targets NX region
   always_comb begin
     fetch_fault_o         = 1'b0;
-    fetch_fault_cause_o   = 32'h0000_0001; // Instruction access fault (adjust to scause code map)
+    fetch_fault_cause_o   = {27'h0,SCAUSE_HARVARD_VIOLATION}; // 0xA per scause map // Instruction access fault (adjust to scause code map)
     fetch_fault_tval_o    = if_addr_i;
     if (if_req_i && !mpu_exec_allow_i) begin
       fetch_fault_o = 1'b1;

@@ -28,7 +28,12 @@ module dcache #(
   input  logic [31:0] cpu_wdata,
   output logic [31:0] cpu_rdata,
   output logic        cpu_done,      // 1 when the access (load/store) has completed
+  input  logic        inv_all,
+  output logic        inv_ack,
   output logic        cpu_fault,     // propagated from memory on refill/forward
+  // Security: cache control
+  input  logic          inv_all,
+
 
   // Memory side (to arbiter m0)
   output logic        mem_req,
@@ -45,6 +50,9 @@ module dcache #(
 // ----- Hoisted declarations for Yosys SV parser -----
   integer i;  // hoisted loop var from for(...) header
   integer w;  // hoisted loop var from for(...) header
+
+  // Flush handshake
+  logic inv_seen_q;
 
 // -------- Address decomposition --------
   localparam integer LINE_BITS = $clog2(LINES);
@@ -222,7 +230,22 @@ always_comb begin
         tagv_tag[i]   <= '0;
         for (w = 0; w < LINE_WORDS; w++) data[i][w] <= 32'h0;
       end
-    end else begin
+    
+      inv_seen_q <= 1'b0;
+      inv_ack    <= 1'b0;
+end else begin
+      // Flush-ack: pulse one cycle after consuming inv_all
+      inv_seen_q <= inv_all;
+      inv_ack    <= inv_seen_q;
+
+      // Invalidate-all on inv_all
+      if (inv_all) begin
+        integer k;
+        for (k=0;k<LINES;k=k+1) begin
+          tagv_valid[k] <= 1'b0;
+        end
+      end
+
       st_q <= st_n;
       rf_cnt_q <= rf_cnt_n;
       rf_pending_q <= rf_pending_n;
