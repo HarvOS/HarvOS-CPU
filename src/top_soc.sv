@@ -34,8 +34,17 @@ module top_soc(
   // DMA master port (optional)
   harvos_dmem_if dma
 );
+
+  
+  // Dummy sink for unused DMA Firewall readback (Yosys dislikes tying output to constants)
+// Exported from core: sticky LOCK bit
+  logic smpuctl_lock;
+  logic sfence_global;
+  logic asid_change_pulse;
+
   // Harvard IFs
   harvos_imem_if imem();
+  harvos_imem_if imem_cache();
   harvos_dmem_if dmem();
 
   
@@ -81,15 +90,15 @@ localparam logic        MPU2_IS_ISPACE = 1'b0;          // D-space
   // Strobes and data to the core's programming port
 // --- Synth-friendly MPU programming FSM (array-free, no latches) ---
 // Region 0 (ROM / I-space): R-X (execute allowed, read allowed, write disallowed)
-localparam logic [31:0] MPU0_BASE      = 32'h0000_0000; // TODO adjust
-localparam logic [31:0] MPU0_LIMIT     = 32'h0000_FFFF; // TODO adjust
+localparam logic [31:0] MPU0_BASE      = 32'h0000_0000; // NOTE: adjust to your memory map as needed
+localparam logic [31:0] MPU0_LIMIT     = 32'h0000_FFFF; // NOTE: adjust to your memory map as needed
 localparam logic [2:0]  MPU0_PERM      = 3'b101;        // {X,W,R}
 localparam logic        MPU0_USER_OK   = 1'b1;
 localparam logic        MPU0_IS_ISPACE = 1'b1;
 
 // Region 1 (RAM): R/W, NX
-localparam logic [31:0] MPU1_BASE      = 32'h2000_0000; // TODO adjust
-localparam logic [31:0] MPU1_LIMIT     = 32'h2001_FFFF; // TODO adjust
+localparam logic [31:0] MPU1_BASE      = 32'h2000_0000; // NOTE: adjust to your memory map as needed
+localparam logic [31:0] MPU1_LIMIT     = 32'h2001_FFFF; // NOTE: adjust to your memory map as needed
 localparam logic [2:0]  MPU1_PERM      = 3'b011;        // {X,W,R}
 localparam logic        MPU1_USER_OK   = 1'b1;
 localparam logic        MPU1_IS_ISPACE = 1'b0;
@@ -178,32 +187,60 @@ harvos_core u_core (
     .mpu_prog_limit(mpu_prog_limit_q),
     .mpu_prog_perm(mpu_prog_perm_q),
     .mpu_prog_user_ok(mpu_prog_user_ok_q),
-    .mpu_prog_is_ispace(mpu_prog_is_ispace_q) //b0)
+    .mpu_prog_is_ispace(mpu_prog_is_ispace_q),
+    .smpuctl_lock_o(smpuctl_lock),
+    .sfence_global_o(sfence_global),
+    .asid_change_pulse_o(asid_change_pulse)
+  ,
+    .lock_set_i(boot_lock_pulse)
+  ,
+    .smpuctl_lock_o(smpuctl_lock),
+    .dc_way_mask_i (dc_way_mask)
   );
 
+  
+  // I-Cache between core IMEM and memory/ROM
+  icache u_icache (
+    .clk(clk), .rst_n(rst_n),
+    // CPU side from core
+    .cpu_req(imem.req),
+    .mpu_exec_allow(ext_icache_exec_allow), // core/MPU enforces execute rights; cache not authoritative
+    .cpu_addr(imem.addr),
+    .cpu_rdata(ic_cpu_rdata),
+    .cpu_rvalid(ic_cpu_rvalid),
+    .cpu_fault(ic_cpu_fault),
+    // flush
+    .inv_all(ic_inv),
+    // memory side to ROM/RAM mux
+    .mem(imem_cache)
+  );
+
+  // Drive core's IMEM return from I-Cache CPU side
+  assign imem.rdata  = ic_cpu_rdata;
+  assign imem.rvalid = ic_cpu_rvalid;
+  assign imem.fault  = ic_cpu_fault;
+
   // ---------------- I$ side mux: Boot ROM vs RAM/Arb ----------------
+  // I-Cache CPU-side wires
+  logic [31:0] ic_cpu_rdata;
+  logic        ic_cpu_rvalid;
+  logic        ic_cpu_fault;
+  logic        ic_inv;
+
   localparam integer ROM_BYTES = 16*1024; // 16 KiB @ 0x0000_0000
   logic        rom_req;
   logic [31:0] rom_addr;
   logic [31:0] rom_rdata;
   logic        rom_rvalid;
   logic        rom_fault;
+  wire rom_sel = (ic_m_addr < ROM_BYTES);
 
-  // Expose core's I-side
-  wire        ic_m_req   = imem.req;
-  wire [31:0] ic_m_addr  = imem.addr;
-
-  // ROM window select
-  wire        rom_sel    = (ic_m_addr < ROM_BYTES);
-  assign rom_req         = ic_m_req & rom_sel;
-  assign rom_addr        = ic_m_addr;
-
-  // I-side to RAM arbiter path when not ROM
-  wire        i_req_arb  = ic_m_req & ~rom_sel;
-  wire [31:0] i_addr_arb = ic_m_addr;
-  wire [31:0] i_rdata_arb;
-  wire        i_rvalid_arb;
-  wire        i_fault_arb;
+  // Expose I-Cache memory side
+  wire        ic_m_req   = imem_cache.req;
+  wire [31:0] ic_m_addr  = imem_cache.addr;
+  wire [31:0] ic_m_rdata;
+  wire        ic_m_rvalid;
+  wire        ic_m_fault;
 
   // ---------------- D-side signals into shared RAM ------------------
   wire        d_req_arb   = dmem.req;
@@ -212,13 +249,85 @@ harvos_core u_core (
   wire [31:0] d_addr_arb  = dmem.addr;
   wire [31:0] d_wdata_arb = dmem.wdata;
 
-  // ---------------- Simple 2:1 arbiter for shared RAM ---------------
+  
+  // ---------------- D-Cache (between CPU D-side and RAM) ---------------
+  dcache u_dcache (
+    .clk(clk), .rst_n(rst_n),
+    // CPU side (gate off MMIO accesses so they bypass the cache path)
+    .cpu_req   (d_req_arb && !cache_mmio_hit && !code_mmio_hit),
+    .cpu_we    (d_we_arb),
+    .cpu_be    (d_be_arb),
+    .cpu_addr  (d_addr_arb),
+    .cpu_wdata (d_wdata_arb),
+    .cpu_rdata (dcache_cpu_rdata),
+    .cpu_done  (dcache_cpu_done),
+    .cpu_fault (dcache_cpu_fault),
+    // MEM side
+    .mem_req   (dc_m_req),
+    .mem_we    (dc_m_we),
+    .mem_be    (dc_m_be),
+    .mem_addr  (dc_m_addr),
+    .mem_wdata (dc_m_wdata),
+    .mem_rdata (dc_m_rdata),
+    .mem_rvalid(dc_m_rvalid),
+    .mem_fault (dc_m_fault),
+    // Flush control
+    .inv_all   (dc_inv),
+    .inv_ack   (dc_inv_ack)
+  );
+// ---------------- Simple 2:1 arbiter for shared RAM ---------------
   // Priority: I-side when requesting, else D-side
   logic        m_req, m_we;
   logic [3:0]  m_be;
   logic [31:0] m_addr, m_wdata;
   logic [31:0] m_rdata;
   logic        m_rvalid, m_fault;
+  // --- HarvOS MMIO blocks: cache control + code immutability ---
+  localparam logic [31:0] CACHE_CTRL_ADDR = 32'h1000_0100;
+  localparam logic [31:0] CODE_CTRL_ADDR  = 32'h1000_0110;
+
+  localparam logic [31:0] DMAFW_CTRL_ADDR = 32'h1000_0120;
+  localparam logic [31:0] SIGCHECK_ADDR   = 32'h1000_0130;
+
+  // MMIO decode/write strobes (D-side)
+  logic        cache_mmio_hit, code_mmio_hit;
+  logic        dmafw_mmio_hit, sig_mmio_hit;
+  logic        mmio_wr;
+  logic [3:0]  mmio_be;
+  logic [31:0] mmio_wdata;
+  logic [31:0] dmafw_mmio_rdata;
+  logic [31:0] sig_mmio_rdata;
+
+  // MMIO readbacks
+  logic [31:0] cache_mmio_rdata;
+  logic [31:0] code_mmio_rdata;
+
+  // D$ invalidate signal (to SoC-internal caches if present)
+  logic        dc_inv;
+
+  
+  
+  // --- Boot signature check (MMIO-triggered). Must pass before WP/LOCK ---
+  logic boot_sig_ok;
+  boot_sigcheck u_boot_sig (
+    .clk(clk), .rst_n(rst_n), .lock_i(smpuctl_lock),
+    .wr_en(sig_mmio_hit & mmio_wr),
+    .wr_data(mmio_wdata),
+    .rd_data(sig_mmio_rdata),
+    .sig_ok(boot_sig_ok)
+  );
+
+  // --- Boot policy sequencer: set WP, flush caches, then LOCK ---
+  typedef enum logic [2:0] { BP_SIGWAIT, BP_WP, BP_FLUSH, BP_LOCK, BP_DONE } boot_e;
+  boot_e boot_phase_q;
+  logic  boot_wp_pulse, boot_cache_wr, boot_lock_pulse;
+  logic [31:0] boot_cache_wdata;
+// Code immutability signals
+  logic        code_update_en_q;
+  logic        code_wp_q;
+  logic        code_wp_set_pulse;
+  logic        allow_code_write;
+
 
   always_comb begin
     // default
@@ -234,17 +343,127 @@ harvos_core u_core (
       m_be    = 4'b0000;
       m_addr  = i_addr_arb;
       m_wdata = 32'h0;
-    end else if (d_req_arb) begin
+    end else if (dc_m_req) begin
       m_req   = 1'b1;
-      m_we    = d_we_arb;
-      m_be    = d_be_arb;
-      m_addr  = d_addr_arb;
-      m_wdata = d_wdata_arb;
+      m_we    = dc_m_we & allow_code_write;
+      m_be    = dc_m_be;
+      m_addr  = dc_m_addr;
+      m_wdata = dc_m_wdata;
     end
 
   end
 
-  // DMA firewall
+  // Cache security control (flush via MMIO)
+  logic ic_flush_req;
+  logic [3:0] ic_way_mask_unused;
+  cache_sec_ctrl #(.I_WAYS(1), .D_WAYS(2)) u_cache_ctrl_top (
+    .clk(clk), .rst_n(rst_n),
+    .asid_change_pulse(asid_change_pulse),
+    .sfence_global(sfence_global),
+    .lock_i(smpuctl_lock),
+    .wr_en((cache_mmio_hit & mmio_wr) | boot_cache_wr),
+    .wr_data(boot_cache_wr ? boot_cache_wdata : mmio_wdata),
+    .rd_data(cache_mmio_rdata),
+    .ic_flush_req(ic_flush_req),
+    .dc_flush_req(/*autowire*/),
+    .ic_way_mask(ic_way_mask_unused),
+    .dc_way_mask(dc_way_mask)
+  );
+  wire dc_flush_req_w = u_cache_ctrl_top.dc_flush_req;
+
+  // Observe D$ way mask (2-way)
+  logic [1:0] dc_way_mask;
+
+  cache_flush_adapter #(.HOLD_CYCLES(8)) u_dc_flush_top (
+    .clk(clk), .rst_n(rst_n),
+    .flush_req(dc_flush_req_w),
+    .flush_ack(dc_inv_ack),
+    .flush_do(dc_inv)
+  );
+
+  // I$ flush pulse stretcher
+  cache_flush_adapter #(.HOLD_CYCLES(8)) u_ic_flush_top (
+    .clk(clk), .rst_n(rst_n),
+    .flush_req(ic_flush_req),
+    .flush_ack(1'b0),
+    .flush_do(ic_inv)
+  );
+
+  
+
+  // Code immutability control
+  code_sec_ctrl u_code_ctrl (
+    .clk(clk), .rst_n(rst_n), .lock_i(smpuctl_lock),
+    .wr_en((code_mmio_hit & mmio_wr) | boot_wp_pulse), .wr_data(boot_wp_pulse ? 32'h1 : mmio_wdata),
+    .update_en_q(code_update_en_q), .wp_set_pulse(code_wp_set_pulse), .rd_data(code_mmio_rdata)
+  );
+  code_wp_latch u_code_wp (
+    .clk(clk), .rst_n(rst_n), .lock_i(smpuctl_lock), .wp_set_i(code_wp_set_pulse | boot_wp_pulse), .manuf_mode_i(1'b0),
+    .wp_q(code_wp_q)
+  );
+  // Define code window as Boot ROM [0 .. ROM_BYTES-1]
+  code_guard #(.CODE0_BASE(32'h0000_0000), .CODE0_LIMIT(ROM_BYTES-1)) u_code_guard (
+    .req_valid(d_req_arb),
+    .req_write(d_we_arb),
+    .req_addr (d_addr_arb),
+    .lock_i(smpuctl_lock),
+    .wp_q(code_wp_q),
+    .update_en(code_update_en_q),
+    .allow_write(allow_code_write)
+  );
+
+  
+  // Boot policy FSM
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      boot_phase_q     <= BP_SIGWAIT;
+      boot_wp_pulse    <= 1'b0;
+      boot_cache_wr    <= 1'b0;
+      boot_lock_pulse  <= 1'b0;
+      boot_cache_wdata <= 32'h0;
+    end else begin
+      // defaults
+      boot_wp_pulse    <= 1'b0;
+      boot_cache_wr    <= 1'b0;
+      boot_lock_pulse  <= 1'b0;
+      case (boot_phase_q)
+      BP_SIGWAIT: begin
+        boot_wp_pulse   = 1'b0;
+        boot_cache_wr   = 1'b0;
+        boot_lock_pulse = 1'b0;
+        if (boot_sig_ok) begin
+          boot_phase_q <= BP_WP;
+        end
+      end
+        BP_WP: begin
+          // set code write-protect latch
+          boot_wp_pulse <= 1'b1;
+          boot_phase_q  <= BP_FLUSH;
+        end
+        BP_FLUSH: begin
+          // force both I$ and D$ flush once
+          boot_cache_wr    <= 1'b1;
+          boot_cache_wdata <= (32'h1 << 7) | (32'h1 << 6); // DC_FLUSH | IC_FLUSH
+          boot_phase_q     <= BP_LOCK;
+        end
+        BP_LOCK: begin
+          // finally set global LOCK
+          boot_lock_pulse <= 1'b1;
+          boot_phase_q    <= BP_DONE;
+        end
+        default: begin end
+      endcase
+    end
+  end
+// MMIO decode (D-side)
+  assign cache_mmio_hit = d_req_arb && (d_addr_arb == CACHE_CTRL_ADDR);
+  assign code_mmio_hit  = d_req_arb && (d_addr_arb == CODE_CTRL_ADDR);
+  assign mmio_wr        = d_we_arb;
+  assign mmio_wdata     = d_wdata_arb;
+
+  
+  assign sig_mmio_hit  = d_req_arb && (d_addr_arb == SIGCHECK_ADDR);
+// DMA firewall
 // Parameters: ROM window = 16 KiB (boot ROM). No privileged regions by default.
 logic        dma_fw_req;
 logic        dma_fw_we;
@@ -252,11 +471,20 @@ logic [3:0]  dma_fw_be;
 logic [31:0] dma_fw_addr;
 logic [31:0] dma_fw_wdata;
 
+
+  // DMA Firewall config via MMIO (write disabled after LOCK)
+  wire cfg_access = dmafw_mmio_hit;
+  wire cfg_write  = cfg_access & mmio_wr & ~smpuctl_lock;
+  wire cfg_read   = cfg_access & ~mmio_wr;
+
+  // Tie firewall cfg ports
+  // Note: addr[3:0] used to select simple regs per harvos_dma_firewall spec
+
 harvos_dma_firewall u_dma_fw (
   .clk   (clk),
   .rst_n (rst_n),
   // cfg tied-off (can be MMIO-mapped later)
-  .cfg_en(1'b0), .cfg_we(1'b0), .cfg_addr(4'h0), .cfg_wdata(32'h0), .cfg_be(4'h0), .cfg_rdata(),
+  .cfg_en(cfg_access), .cfg_we(cfg_write), .cfg_addr(d_addr_arb[3:0]), .cfg_wdata(mmio_wdata), .cfg_be(mmio_be), .cfg_rdata(dmafw_mmio_rdata),
   .dma   (dma_mux),
 
   .fw_req   (dma_fw_req),
@@ -284,7 +512,7 @@ always_comb begin
     m_be    = 4'b0000;
     m_addr  = i_addr_arb;
     m_wdata = 32'h0;
-  end else if (d_req_arb) begin
+  end else if (dc_m_req) begin
     m_req   = 1'b1;
     m_we    = d_we_arb;
     m_be    = d_be_arb;
@@ -319,7 +547,12 @@ end
     else        owner_q <= owner_n;
   end
 
-  // Return paths to I, D, and DMA
+  
+  // Feed D-Cache MEM-side return
+  assign dc_m_rdata  = m_rdata;
+  assign dc_m_rvalid = m_rvalid & (owner_q==OWN_D);
+  assign dc_m_fault  = m_fault  & (owner_q==OWN_D);
+// Return paths to I, D, and DMA
 
   assign i_rdata_arb  = m_rdata;
   assign i_rvalid_arb = m_rvalid & (owner_q==OWN_I);
@@ -332,13 +565,30 @@ end
       dmem.fault <= 1'b0;
     end else begin
       // D-path response
-      dmem.done  <= m_rvalid & (owner_q==OWN_D);
-      if (m_rvalid & (owner_q==OWN_D) & ~d_we_arb) begin
-        dmem.rdata <= m_rdata;
+      if (cache_mmio_hit) begin
+        dmem.done  <= 1'b1;
+        dmem.rdata <= cache_mmio_rdata;
+        dmem.fault <= 1'b0;
+      end else if (code_mmio_hit) begin
+        dmem.done  <= 1'b1;
+        dmem.rdata <= code_mmio_rdata;
+        dmem.fault <= 1'b0;
+      end else if (dmafw_mmio_hit) begin
+        dmem.done  <= 1'b1;
+        dmem.rdata <= dmafw_mmio_rdata;
+        dmem.fault <= 1'b0;
+      end else if (sig_mmio_hit) begin
+        dmem.done  <= 1'b1;
+        dmem.rdata <= sig_mmio_rdata;
+        dmem.fault <= 1'b0;
+      end else begin
+        dmem.done  <= dcache_cpu_done;
+        if (dcache_cpu_done && !d_we_arb) begin
+          dmem.rdata <= dcache_cpu_rdata;
+        end
+        dmem.fault <= dcache_cpu_fault;
       end
-      dmem.fault <= m_fault & (owner_q==OWN_D);
-
-      // DMA response (proxied by firewall)
+// DMA response (proxied by firewall)
       if (m_rvalid & dma_fw_req & ~dma_fw_we) begin
         // rdata is driven inside u_dma_fw; nothing to do here
       end
@@ -361,9 +611,13 @@ end
   );
 
   // ------------------- I-side return mux (ROM vs RAM) ---------------
-  assign imem.rdata  = rom_sel ? rom_rdata  : i_rdata_arb;
-  assign imem.rvalid = rom_sel ? rom_rvalid : i_rvalid_arb;
-  assign imem.fault  = rom_sel ? rom_fault  : i_fault_arb;
+  assign imem_cache.rdata  = ic_m_rdata;
+  assign imem_cache.rvalid = ic_m_rvalid;
+  assign imem_cache.fault  = ic_m_fault;
+
+  assign ic_m_rdata  = rom_sel ? rom_rdata  : i_rdata_arb;
+  assign ic_m_rvalid = rom_sel ? rom_rvalid : i_rvalid_arb;
+  assign ic_m_fault  = rom_sel ? rom_fault  : i_fault_arb;
 
   // ------------------- Debug/keep outputs ---------------------------
   // Mark with keep so they don't get optimized away even if identical
